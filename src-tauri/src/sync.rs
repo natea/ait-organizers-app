@@ -8,7 +8,7 @@ use tauri_plugin_notification::NotificationExt;
 use crate::api::{ApiClient, RateInfo};
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, TRAY_ID};
-use crate::{db, keychain};
+use crate::db;
 
 const UPCOMING_KEY: &str = "upcoming";
 const PAST_KEY: &str = "past";
@@ -20,8 +20,11 @@ fn iso_now() -> String {
 }
 
 /// Build a client from the stored key, or `None` if onboarding isn't done.
-fn client() -> AppResult<Option<ApiClient>> {
-    Ok(keychain::get_key()?.map(ApiClient::new))
+fn client(app: &AppHandle) -> AppResult<Option<ApiClient>> {
+    Ok(app
+        .state::<AppState>()
+        .api_key_cached()?
+        .map(ApiClient::new))
 }
 
 /// Parse `retry_after=NN` out of a rate-limit error message.
@@ -69,7 +72,7 @@ fn as_i64(v: &Value, key: &str) -> i64 {
 /// Run one sync cycle. `force` bypasses backoff-free scheduling for a manual
 /// refresh but still respects an active backoff window.
 pub async fn run_cycle(app: AppHandle, force: bool) -> AppResult<()> {
-    let Some(api) = client()? else {
+    let Some(api) = client(&app)? else {
         return Ok(()); // not onboarded yet
     };
 
@@ -221,7 +224,7 @@ async fn do_upcoming(app: &AppHandle, api: &ApiClient) -> AppResult<RateInfo> {
 /// refresh only — never on the upcoming poll interval. Past events are frozen:
 /// they never fire notifications and never claim the tray "next event".
 pub async fn run_past(app: AppHandle) -> AppResult<()> {
-    let Some(api) = client()? else {
+    let Some(api) = client(&app)? else {
         return Ok(());
     };
     if in_backoff(&app, PAST_KEY) {
@@ -312,7 +315,7 @@ pub async fn run_past(app: AppHandle) -> AppResult<()> {
 /// Fetch performance + awaiting-payment for one event (on demand). Both are
 /// chapter-scoped; out-of-scope events degrade to a "not enabled" state.
 pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
-    let Some(api) = client()? else {
+    let Some(api) = client(app)? else {
         return Ok(());
     };
 
@@ -473,7 +476,7 @@ fn job_is_active(job: &Value) -> bool {
 /// app launch and manual refresh only — never on the 2-minute loop (task 3.1).
 /// Gated by `subscribers_sponsors` + city-owner scope; degrades cleanly.
 pub async fn fetch_chapter_email(app: &AppHandle) -> AppResult<()> {
-    let Some(api) = client()? else {
+    let Some(api) = client(app)? else {
         return Ok(());
     };
     if in_backoff(app, EMAIL_CHAPTER_KEY) {
@@ -601,7 +604,7 @@ pub async fn fetch_chapter_email(app: &AppHandle) -> AppResult<()> {
 /// the gentle active-send cadence (task 3.2/3.3). Campaign rates are fetched
 /// once (slow-moving) and skipped while only throughput is being polled.
 pub async fn fetch_event_email(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
-    let Some(api) = client()? else {
+    let Some(api) = client(app)? else {
         return Ok(());
     };
     if in_backoff(app, EMAIL_EVENT_KEY) {
@@ -703,7 +706,7 @@ pub async fn fetch_event_email(app: &AppHandle, meetup_token: &str) -> AppResult
 /// Fetch one send job's progress + throughput series and cache them. Freezes the
 /// snapshot once the job is done so it is no longer polled (spec, design D4).
 async fn poll_send_job(app: &AppHandle, token: &str) {
-    let Some(api) = (match client() {
+    let Some(api) = (match client(app) {
         Ok(c) => c,
         Err(_) => return,
     }) else {

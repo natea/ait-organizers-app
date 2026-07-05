@@ -53,6 +53,50 @@ bun tauri dev             # launch the app (Vite dev server on port 1425)
 The dev server uses **port 1425** (HMR 1426) to avoid clashing with other local
 Tauri apps that default to 1420.
 
+> **Dev-build keychain prompts:** `bun tauri dev` produces an *unsigned, constantly
+> rebuilt* binary. macOS keychain "Always Allow" trusts a specific code signature,
+> so each rebuild is a new identity and the prompt (and re-onboarding) returns.
+> This is expected in dev — a **signed** release build (below) has a stable
+> identity, so you allow it once and it sticks.
+
+## Building & distributing (macOS)
+
+Distributing without the "app is damaged / right-click → Open" friction requires
+a **code-signed + notarized** build. That needs:
+
+1. **Apple Developer Program** membership (paid).
+2. A **Developer ID Application** certificate in your login keychain
+   (Xcode → Settings → Accounts → *team* → Manage Certificates → **+** → *Developer ID Application*).
+3. A notarization credential — an **app-specific password**
+   ([account.apple.com](https://account.apple.com) → Sign-In and Security →
+   App-Specific Passwords) or an **App Store Connect API key**.
+
+Then build with the helper script (it auto-detects your Developer ID cert):
+
+```bash
+# Notarized build — set your notarization credentials first:
+export APPLE_ID="you@example.com"
+export APPLE_PASSWORD="app-specific-password"
+export APPLE_TEAM_ID="YA3FM9C24T"
+bash scripts/build-macos.sh          # signs, notarizes, staples → .dmg
+```
+
+Without the notarization vars, `bash scripts/build-macos.sh` still produces a
+**signed** build (fixes the dev keychain-prompt issue on your own Mac) — it just
+isn't notarized, so other people would still need the workaround.
+
+Artifacts land under `src-tauri/target/release/bundle/` (`macos/*.app`,
+`dmg/*.dmg`). Verify:
+
+```bash
+spctl -a -vvv -t install "src-tauri/target/release/bundle/macos/AIT Mission Control.app"
+# notarized → "accepted — source=Notarized Developer ID"
+```
+
+> The DMG step runs an AppleScript that needs an interactive GUI session — run
+> the build in your own Terminal (not a headless/CI shell) for the `.dmg`, or
+> pass `--bundles app` to ship just the `.app`.
+
 ## Architecture
 
 - `src-tauri/src/api.rs` — API client: Bearer auth, envelope unwrap, typed errors, rate headers.
