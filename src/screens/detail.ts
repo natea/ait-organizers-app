@@ -11,6 +11,8 @@ interface DetailOpts {
 
 export interface DetailController {
   open: (meetupToken: string) => Promise<void>;
+  /** Re-render from cache only (no network) — used for background updates. */
+  refresh: (meetupToken: string) => Promise<void>;
 }
 
 export function mountDetail(opts: DetailOpts): DetailController {
@@ -32,6 +34,15 @@ export function mountDetail(opts: DetailOpts): DetailController {
     }
   }
 
+  // Cache-only re-render for background "detail:updated" events. Must NOT call
+  // fetchEventDetail — that would re-emit "detail:updated" and loop forever
+  // (continuous re-render + API hammering).
+  async function refresh(meetupToken: string): Promise<void> {
+    if (meetupToken !== current) return;
+    const cached = await getEventDetail(meetupToken);
+    if (cached && meetupToken === current) render(cached);
+  }
+
   function render(ev: EventObj): void {
     root.innerHTML = `
       <div class="appbar">
@@ -43,7 +54,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
     byId<HTMLButtonElement>("backBtn").addEventListener("click", opts.onBack);
   }
 
-  return { open };
+  return { open, refresh };
 }
 
 function bodyHTML(ev: EventObj): string {
