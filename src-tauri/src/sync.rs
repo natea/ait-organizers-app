@@ -11,6 +11,8 @@ use crate::state::{AppState, TRAY_ID};
 use crate::{db, keychain};
 
 const UPCOMING_KEY: &str = "upcoming";
+const PAST_KEY: &str = "past";
+const PAST_LIMIT: u32 = 50;
 const MAX_BACKOFF_SECS: i64 = 60;
 
 fn iso_now() -> String {
@@ -162,7 +164,8 @@ async fn do_upcoming(app: &AppHandle, api: &ApiClient) -> AppResult<RateInfo> {
         let conn = state.db.lock().unwrap();
         let prev = db::prev_counts(&conn, &meetup_token).unwrap_or(None);
         db::upsert_event(
-            &conn, &meetup_token, weblog_token, starts_at, attending, waitlisted, paid, ev, &now,
+            &conn, &meetup_token, weblog_token, starts_at, attending, waitlisted, paid,
+            "upcoming", ev, &now,
         )?;
         drop(conn);
 
@@ -185,7 +188,7 @@ async fn do_upcoming(app: &AppHandle, api: &ApiClient) -> AppResult<RateInfo> {
     {
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
-        db::retain_events(&conn, &keep)?;
+        db::retain_events(&conn, "upcoming", &keep)?;
         db::set_sync_state(
             &conn,
             UPCOMING_KEY,
@@ -212,6 +215,98 @@ async fn do_upcoming(app: &AppHandle, api: &ApiClient) -> AppResult<RateInfo> {
         .first_sync_done
         .store(true, Ordering::SeqCst);
     Ok(ok.rate)
+}
+
+/// Fetch the caller's past events (recap data). Runs on launch and manual
+/// refresh only — never on the upcoming poll interval. Past events are frozen:
+/// they never fire notifications and never claim the tray "next event".
+pub async fn run_past(app: AppHandle) -> AppResult<()> {
+    let Some(api) = client()? else {
+        return Ok(());
+    };
+    if in_backoff(&app, PAST_KEY) {
+        return Ok(());
+    }
+
+    let ok = match api.past_events(PAST_LIMIT).await {
+        Ok(ok) => ok,
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(&app, PAST_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(e) => {
+            // Degrade quietly; the Upcoming tab is unaffected.
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            let _ = db::set_sync_state(
+                &conn, PAST_KEY, None, None, None,
+                e.is_capability_block(), Some(&e.to_string()),
+            );
+            return Err(e);
+        }
+    };
+
+    // Search returns matches[]; tolerate an events[] fallback.
+    let events = ok
+        .data
+        .get("matches")
+        .or_else(|| ok.data.get("events"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+
+    let now = iso_now();
+    let mut keep: Vec<String> = Vec::new();
+
+    for ev in &events {
+        let meetup_token = ev
+            .get("meetup_token")
+            .and_then(Value::as_str)
+            .or_else(|| ev.get("refs").and_then(|r| r.get("meetup_token")).and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        if meetup_token.is_empty() {
+            continue;
+        }
+
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        // Dedupe: if a token is already cached as upcoming (around start time),
+        // let the upcoming row win — don't shadow it with a past copy.
+        if db::event_kind(&conn, &meetup_token).unwrap_or(None).as_deref() == Some("upcoming") {
+            continue;
+        }
+        let weblog_token = ev.get("weblog_token").and_then(Value::as_str).unwrap_or_default();
+        let starts_at = ev
+            .get("starts_at_utc")
+            .and_then(Value::as_str)
+            .or_else(|| ev.get("starts_at").and_then(Value::as_str))
+            .unwrap_or_default();
+        let rsvps = ev.get("rsvps").cloned().unwrap_or(Value::Null);
+        let attending = as_i64(&rsvps, "attending");
+        let waitlisted = as_i64(&rsvps, "waitlisted");
+        let paid = ev.get("stripe_payment_link_active").and_then(Value::as_bool).unwrap_or(false);
+        // No prev-diff and no notifications for past events (frozen recap).
+        db::upsert_event(
+            &conn, &meetup_token, weblog_token, starts_at, attending, waitlisted, paid,
+            "past", ev, &now,
+        )?;
+        keep.push(meetup_token);
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::retain_events(&conn, "past", &keep)?;
+        db::set_sync_state(
+            &conn, PAST_KEY, Some(&now), ok.rate.remaining, None, false,
+            if truncated { Some("truncated") } else { None },
+        )?;
+    }
+
+    let _ = app.emit("sync:updated", json!({ "at": iso_now(), "kind": "past" }));
+    Ok(())
 }
 
 /// Fetch performance + awaiting-payment for one event (on demand). Both are
@@ -247,17 +342,18 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
 
     let now = iso_now();
 
-    // Performance (aggregate row) — degrade on scope/group blocks.
+    // Performance (aggregate row) — degrade on scope/group blocks. The traffic
+    // window spans the ~6 months up to the event so page views reflect real
+    // cumulative traffic, not just the single event-day (fixes >100% conversion).
     if !weblog_token.is_empty() && !event_date.is_empty() {
-        let traffic_from = (Utc::now() - Duration::days(120))
-            .format("%Y-%m-%d")
-            .to_string();
+        let traffic_from = chrono::NaiveDate::parse_from_str(&event_date, "%Y-%m-%d")
+            .map(|d| (d - Duration::days(180)).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| event_date.clone());
         match api
-            .performance(&weblog_token, &event_date, &event_date)
+            .performance_windowed(&weblog_token, &event_date, &event_date, &traffic_from, &event_date)
             .await
         {
             Ok(ok) => {
-                let _ = traffic_from;
                 let row = ok
                     .data
                     .get("events")
@@ -302,13 +398,18 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
         }
     }
 
-    // Summary count (best-effort).
+    // RSVP total + real door check-in count (best-effort). The check-in count
+    // is the true attendance figure; `performance.completed` is not.
     if let Ok(ok) = api.rsvp_summary(meetup_token).await {
         let total = ok.data.get("total_count").and_then(Value::as_i64).unwrap_or(0);
         let groups = ok.data.get("groups").cloned();
+        let checked_in = match api.rsvp_checked_in_count(meetup_token).await {
+            Ok(c) => c.data.get("total_count").and_then(Value::as_i64),
+            Err(_) => None,
+        };
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
-        let _ = db::upsert_summary(&conn, meetup_token, total, groups.as_ref(), &now);
+        let _ = db::upsert_summary(&conn, meetup_token, total, checked_in, groups.as_ref(), &now);
     }
 
     let _ = app.emit("detail:updated", json!({ "meetup_token": meetup_token }));
@@ -350,6 +451,10 @@ pub fn next_event_json(app: &AppHandle) -> Option<Value> {
     let mut candidates: Vec<Value> = events
         .into_iter()
         .filter(|ev| {
+            // Past events are never eligible for the tray "next event".
+            if ev.get("kind").and_then(Value::as_str) == Some("past") {
+                return false;
+            }
             let rel = ev.get("relative_day_in_event_timezone").and_then(Value::as_str);
             let days = ev
                 .get("days_until_event_in_event_timezone")

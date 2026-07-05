@@ -24,10 +24,11 @@ pub async fn validate_and_store(app: AppHandle, key: String) -> AppResult<Value>
         return Err(AppError::Unauthorized("Key did not validate".into()));
     }
     keychain::store_key(&key)?;
-    // Kick off an initial sync in the background.
+    // Kick off an initial sync (upcoming + past) in the background.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = sync::run_cycle(app2, true).await;
+        let _ = sync::run_cycle(app2.clone(), true).await;
+        let _ = sync::run_past(app2).await;
     });
     Ok(identity)
 }
@@ -93,9 +94,12 @@ pub async fn fetch_event_detail(app: AppHandle, meetup_token: String) -> AppResu
 }
 
 /// Manual refresh — an immediate cycle within rate-limit constraints (D3).
+/// Refreshes both upcoming and past (past is otherwise only fetched at launch).
 #[tauri::command]
 pub async fn refresh_now(app: AppHandle) -> AppResult<()> {
-    sync::run_cycle(app, true).await
+    let up = sync::run_cycle(app.clone(), true).await;
+    let _ = sync::run_past(app).await;
+    up
 }
 
 #[tauri::command]

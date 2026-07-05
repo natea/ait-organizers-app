@@ -42,26 +42,35 @@ the tray "next event" widget.
 - **THEN** only upcoming (future) events are eligible; past events are never selected
 
 ### Requirement: Past event card variant
-A past-event card SHALL show a "held" date chip instead of a countdown, a
-check-in gauge (checked-in vs capacity) when a check-in count is available, and an
-"Attended" figure in place of the "Waitlisted" funnel cell.
+A past-event card SHALL show a "held" date chip instead of a countdown, a final
+attendance gauge (attending vs capacity) when capacity is known, and a funnel of
+Total / Attending / Waitlisted / Cancelled. The Total is derived (attending +
+waitlisted + cancelled) because the API's `registered` field is 0 for these
+events; a "Registered" figure SHALL NOT be shown.
 
 #### Scenario: Past card rendering
 - **WHEN** a past event with a known held date and final counts is shown
-- **THEN** the card shows the held-date chip, an Attended value, and (if capacity known) a checked-in gauge
+- **THEN** the card shows the held-date chip, a Total/Attending/Waitlisted/Cancelled funnel, and (if capacity known) an attending gauge
 
-#### Scenario: Check-in count unavailable
-- **WHEN** the checked-in count is not available for a past event
-- **THEN** the card falls back to the final attending count, labeled accordingly, without erroring
+#### Scenario: No fabricated attendance
+- **WHEN** rendering the list card (which has no per-event check-in data)
+- **THEN** the card SHALL NOT present a check-in/"attended" figure derived from RSVP counts; the true check-in count is shown only on the detail view
 
 ### Requirement: Past event detail recap
-The detail view for a past event SHALL use recap framing: a "held" chip, an
-"Attended" row in the RSVP summary, "final" labels, and a footer indicating the
-data is frozen and the event is no longer polled.
+The detail view for a past event SHALL use recap framing: a "held" chip,
+"final" labels, and a footer indicating the data is frozen and the event is no
+longer polled. The RSVP summary SHALL show Total / Attending / Waitlisted /
+Cancelled (no "Registered" row). The true door check-in count SHALL come from
+`rsvps/summary` with `status=checked_in` (not from performance "completed
+RSVPs"), and conversion SHALL be shown only when it is a valid fraction (≤ 100%).
 
 #### Scenario: Past detail rendering
 - **WHEN** the user opens a past event
-- **THEN** the detail shows the held chip, an Attended row, final-labeled summary, and a "recap — data frozen" footer
+- **THEN** the detail shows the held chip, a Total/Attending/Waitlisted/Cancelled summary, a real "Checked in" figure, and a "recap — data frozen" footer
+
+#### Scenario: Implausible conversion suppressed
+- **WHEN** the performance conversion value exceeds 100% (e.g. a mismatched traffic window)
+- **THEN** the conversion figure is hidden rather than displayed
 
 ### Requirement: Recap window transparency
 WHEN the past-events list is bounded (recap window or API cap), the Past tab SHALL

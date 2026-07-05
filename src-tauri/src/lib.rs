@@ -62,6 +62,8 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Initial cycle shortly after launch (if already onboarded).
                 let _ = sync::run_cycle(handle.clone(), false).await;
+                // Past events fetched once at launch; not part of the poll loop.
+                let _ = sync::run_past(handle.clone()).await;
                 let mut ticker = tokio::time::interval(POLL_INTERVAL);
                 ticker.tick().await; // consume immediate first tick
                 loop {

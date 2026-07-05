@@ -28,6 +28,8 @@ export interface PerformanceRow {
   conversion?: { completed_rsvps_per_page_view?: number };
 }
 
+export type EventKind = "upcoming" | "past";
+
 export interface EventObj {
   meetup_token: string;
   weblog_token?: string;
@@ -46,6 +48,8 @@ export interface EventObj {
   event_url?: string;
   status?: string;
   stripe_payment_link_active?: boolean;
+  // Injected by the Rust cache: which tab this event belongs to.
+  kind?: EventKind;
   rsvps?: Rsvps;
   organizer?: Organizer;
   gallery_preview?: GalleryPhoto[];
@@ -60,7 +64,13 @@ export interface EventObj {
     results?: AwaitingRow[] | null;
     unavailable?: boolean;
   } | null;
-  rsvp_summary?: { total_count?: number; groups?: unknown } | null;
+  rsvp_summary?: {
+    total_count?: number;
+    // Real door check-in count (rsvps/summary status=checked_in); null when
+    // not yet fetched or out of scope.
+    checked_in?: number | null;
+    groups?: unknown;
+  } | null;
 }
 
 export interface AwaitingRow {
