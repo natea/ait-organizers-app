@@ -450,6 +450,320 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
     Ok(())
 }
 
+// ── Email lifecycle sync (specs/email-lifecycle) ───────────────────────────
+
+const EMAIL_CHAPTER_KEY: &str = "email_chapter";
+const EMAIL_EVENT_KEY: &str = "email_event";
+const EMAIL_THROUGHPUT_KEY: &str = "email_throughput";
+/// Throughput bucket size for active-send polling (design D4).
+const THROUGHPUT_BUCKET: &str = "minute";
+
+/// A send job is "active" (still moving) when queued/sending/active and not done.
+fn job_is_active(job: &Value) -> bool {
+    if job.get("done").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    matches!(
+        job.get("status").and_then(Value::as_str),
+        Some("queued") | Some("sending") | Some("active")
+    )
+}
+
+/// Chapter deliverability + fatigue tier summary + recent send jobs. Fetched on
+/// app launch and manual refresh only — never on the 2-minute loop (task 3.1).
+/// Gated by `subscribers_sponsors` + city-owner scope; degrades cleanly.
+pub async fn fetch_chapter_email(app: &AppHandle) -> AppResult<()> {
+    let Some(api) = client()? else {
+        return Ok(());
+    };
+    if in_backoff(app, EMAIL_CHAPTER_KEY) {
+        return Ok(());
+    }
+
+    let weblog = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::primary_weblog(&conn).unwrap_or(None)
+    };
+    let now = iso_now();
+    let mut blocked: Option<String> = None;
+    let mut health: Option<Value> = None;
+    let mut fatigue: Option<Value> = None;
+
+    // Deliverability health (sender-domain rows, health score).
+    match api
+        .email_deliverability_health_get(weblog.as_deref(), None, None)
+        .await
+    {
+        Ok(ok) => {
+            health = Some(ok.data);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            record_rate_locked(&conn, EMAIL_CHAPTER_KEY, &ok.rate);
+        }
+        Err(e) if e.is_capability_block() => blocked = Some(e.code().to_string()),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, EMAIL_CHAPTER_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(_) => {}
+    }
+
+    // Fatigue-risk — store the aggregate tier `summary` only, never per-subscriber
+    // rows or emails (design D5). Skip if the group is already known blocked.
+    if blocked.is_none() {
+        match api.email_fatigue_risk_get(weblog.as_deref(), 1).await {
+            Ok(ok) => {
+                let truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                // Keep only the tier summary; drop `subscribers[]`.
+                fatigue = Some(json!({
+                    "summary": ok.data.get("summary").cloned().unwrap_or(Value::Null),
+                    "truncated": truncated,
+                }));
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                record_rate_locked(&conn, EMAIL_CHAPTER_KEY, &ok.rate);
+            }
+            Err(e) if e.is_capability_block() => blocked = Some(e.code().to_string()),
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, EMAIL_CHAPTER_KEY, parse_retry_after(&msg))
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Recent send jobs across the chapter (partition 'chapter').
+    let mut list_truncated = false;
+    if blocked.is_none() {
+        match api.email_send_jobs_list(Some("all"), None, 25, None, None).await {
+            Ok(ok) => {
+                list_truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+                let jobs = ok
+                    .data
+                    .get("send_jobs")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let mut keep = Vec::new();
+                for job in &jobs {
+                    db::upsert_send_job(&conn, job, None, "chapter", &now)?;
+                    if let Some(t) = job
+                        .get("token")
+                        .or_else(|| job.get("send_job_token"))
+                        .and_then(Value::as_str)
+                    {
+                        keep.push(t.to_string());
+                    }
+                }
+                db::retain_send_jobs(&conn, "chapter", &keep)?;
+                record_rate_locked(&conn, EMAIL_CHAPTER_KEY, &ok.rate);
+            }
+            Err(e) if e.is_capability_block() => blocked = Some(e.code().to_string()),
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, EMAIL_CHAPTER_KEY, parse_retry_after(&msg))
+            }
+            Err(_) => {}
+        }
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::upsert_deliverability(
+            &conn,
+            health.as_ref(),
+            fatigue.as_ref(),
+            list_truncated,
+            blocked.is_some(),
+            blocked.as_deref(),
+            &now,
+        )?;
+        // Stop re-polling a blocked surface (task 3.4).
+        db::set_sync_state(
+            &conn,
+            EMAIL_CHAPTER_KEY,
+            Some(&now),
+            None,
+            None,
+            blocked.is_some(),
+            blocked.as_deref(),
+        )?;
+    }
+
+    let _ = app.emit("email:chapter", json!({ "at": iso_now() }));
+    Ok(())
+}
+
+/// Per-event email surface: send-job summary + campaign performance, plus a
+/// throughput poll for any active job. Called when the Email panel opens and on
+/// the gentle active-send cadence (task 3.2/3.3). Campaign rates are fetched
+/// once (slow-moving) and skipped while only throughput is being polled.
+pub async fn fetch_event_email(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client()? else {
+        return Ok(());
+    };
+    if in_backoff(app, EMAIL_EVENT_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    let mut blocked: Option<String> = None;
+
+    // Aggregate send-job summary + its recent send jobs (partition 'event').
+    let mut active_tokens: Vec<String> = Vec::new();
+    match api.email_send_jobs_summary(meetup_token, 25, None, None).await {
+        Ok(ok) => {
+            let summary = ok.data.get("summary").cloned();
+            let jobs = ok
+                .data
+                .get("send_jobs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            let mut keep = Vec::new();
+            for job in &jobs {
+                db::upsert_send_job(&conn, job, Some(meetup_token), "event", &now)?;
+                if let Some(t) = job
+                    .get("token")
+                    .or_else(|| job.get("send_job_token"))
+                    .and_then(Value::as_str)
+                {
+                    keep.push(t.to_string());
+                    if job_is_active(job) {
+                        active_tokens.push(t.to_string());
+                    }
+                }
+            }
+            db::retain_send_jobs(&conn, "event", &keep)?;
+            db::upsert_event_summary(&conn, meetup_token, summary.as_ref(), None, false, None, &now)?;
+            record_rate_locked(&conn, EMAIL_EVENT_KEY, &ok.rate);
+        }
+        Err(e) if e.is_capability_block() => blocked = Some(e.code().to_string()),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, EMAIL_EVENT_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(_) => {}
+    }
+
+    if let Some(reason) = &blocked {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::upsert_event_summary(&conn, meetup_token, None, None, true, Some(reason), &now)?;
+        db::set_sync_state(&conn, EMAIL_EVENT_KEY, Some(&now), None, None, true, Some(reason))?;
+        let _ = app.emit("email:event", json!({ "meetup_token": meetup_token }));
+        return Ok(());
+    }
+
+    // Campaign open/click performance — fetch once (slow-moving). Skip if cached
+    // so gentle throughput polling doesn't burn the rate budget re-fetching it.
+    let need_campaign = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        !db::has_campaign(&conn, meetup_token).unwrap_or(false)
+    };
+    if need_campaign {
+        match api.email_campaign_performance_get(meetup_token).await {
+            Ok(ok) => {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::upsert_event_summary(&conn, meetup_token, None, Some(&ok.data), false, None, &now)?;
+                record_rate_locked(&conn, EMAIL_EVENT_KEY, &ok.rate);
+            }
+            // Campaign perf is optional enrichment; a block here must not blank
+            // the send accounting (spec: omit open/click, don't error).
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, EMAIL_EVENT_KEY, parse_retry_after(&msg))
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Poll throughput for each active job (design D4). Completed jobs are frozen
+    // and skipped so we never re-poll a finished send.
+    for token in &active_tokens {
+        let already_done = {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::send_job_done(&conn, token).unwrap_or(false)
+        };
+        if already_done {
+            continue;
+        }
+        poll_send_job(app, token).await;
+    }
+
+    let _ = app.emit("email:event", json!({ "meetup_token": meetup_token }));
+    Ok(())
+}
+
+/// Fetch one send job's progress + throughput series and cache them. Freezes the
+/// snapshot once the job is done so it is no longer polled (spec, design D4).
+async fn poll_send_job(app: &AppHandle, token: &str) {
+    let Some(api) = (match client() {
+        Ok(c) => c,
+        Err(_) => return,
+    }) else {
+        return;
+    };
+    if in_backoff(app, EMAIL_THROUGHPUT_KEY) {
+        return;
+    }
+    let now = iso_now();
+
+    // Job detail carries send_progress (observed rate, predicted finish) + done.
+    let mut progress: Option<Value> = None;
+    let mut done = false;
+    match api.email_send_job_get(token).await {
+        Ok(ok) => {
+            let job = ok.data.get("send_job").cloned().unwrap_or(ok.data.clone());
+            done = job.get("done").and_then(Value::as_bool).unwrap_or(false)
+                || matches!(
+                    job.get("status").and_then(Value::as_str),
+                    Some("completed") | Some("failed") | Some("cancelled")
+                );
+            progress = job.get("send_progress").cloned().or(Some(job));
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            record_rate_locked(&conn, EMAIL_THROUGHPUT_KEY, &ok.rate);
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, EMAIL_THROUGHPUT_KEY, parse_retry_after(&msg));
+            return;
+        }
+        Err(_) => {}
+    }
+
+    match api.email_send_job_throughput_get(token, THROUGHPUT_BUCKET).await {
+        Ok(ok) => {
+            let throughput = ok.data.get("throughput").cloned();
+            let peak = ok.data.get("peak_rate_per_minute").and_then(Value::as_f64);
+            let avg = ok.data.get("average_rate_per_minute").and_then(Value::as_f64);
+            let total = ok.data.get("total_sent").and_then(Value::as_f64);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_throughput(
+                &conn, token, throughput.as_ref(), progress.as_ref(), peak, avg, total, done, &now,
+            )
+            .ok();
+            record_rate_locked(&conn, EMAIL_THROUGHPUT_KEY, &ok.rate);
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, EMAIL_THROUGHPUT_KEY, parse_retry_after(&msg))
+        }
+        Err(_) => {
+            // Persist progress/done even if the throughput series is unavailable.
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_throughput(&conn, token, None, progress.as_ref(), None, None, None, done, &now)
+                .ok();
+        }
+    }
+}
+
 fn record_rate(app: &AppHandle, key: &str, rate: &RateInfo) {
     let state = app.state::<AppState>();
     let conn = state.db.lock().unwrap();

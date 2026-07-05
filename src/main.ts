@@ -5,12 +5,14 @@ import { hasKey, onDetailUpdated, onSyncUpdated } from "./api";
 import { renderOnboarding } from "./screens/onboarding";
 import { mountOverview, type OverviewController } from "./screens/overview";
 import { mountDetail, type DetailController } from "./screens/detail";
+import { mountEmail, type EmailController } from "./screens/email";
 import { byId } from "./util";
 
-type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail";
+type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail" | "scr-email";
 
 let overview: OverviewController | null = null;
 let detail: DetailController | null = null;
+let email: EmailController | null = null;
 let currentDetailToken: string | null = null;
 
 function show(id: ScreenId): void {
@@ -26,10 +28,20 @@ function enterApp(): void {
       detail?.open(token);
       show("scr-detail");
     },
+    onOpenEmail: () => {
+      show("scr-email");
+      email?.open();
+    },
   });
   detail = mountDetail({
     onBack: () => {
       currentDetailToken = null;
+      show("scr-overview");
+      overview?.reload();
+    },
+  });
+  email = mountEmail({
+    onBack: () => {
       show("scr-overview");
       overview?.reload();
     },

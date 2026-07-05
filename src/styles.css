@@ -746,6 +746,331 @@ body {
   overflow-y: auto;
 }
 
+/* ── email lifecycle (specs/email-lifecycle) ──────── */
+/* Aggregate stat tiles (delivery accounting + open/click rates) */
+.email-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.stat-tile {
+  background: var(--surface);
+  padding: 10px 6px;
+  text-align: center;
+}
+.stat-tile b {
+  display: block;
+  font: 600 17px/1.2 var(--mono);
+  color: var(--fg);
+}
+.stat-tile small {
+  font-size: 10.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.email-perf {
+  margin-top: 4px;
+}
+.ep-title {
+  font: 700 12px/1 var(--sans);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 6px 0 10px;
+}
+.b-count.live {
+  background: rgba(61, 83, 194, 0.12);
+  color: var(--accent);
+}
+
+/* Send-job status chips */
+.job-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font: 600 11px/1.4 var(--sans);
+  text-transform: capitalize;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.job-chip.sending {
+  background: rgba(61, 83, 194, 0.1);
+  border-color: rgba(61, 83, 194, 0.4);
+  color: var(--accent);
+}
+.job-chip.done {
+  background: rgba(15, 23, 42, 0.04);
+  color: var(--fg);
+}
+.job-chip.failed {
+  background: rgba(190, 40, 40, 0.08);
+  border-color: rgba(190, 40, 40, 0.35);
+  color: #b02525;
+}
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Send-job rows */
+.job-list {
+  display: grid;
+  gap: 10px;
+}
+.job-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.job-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.job-subj {
+  font: 600 13.5px/1.3 var(--sans);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-rate {
+  margin-left: auto;
+  font: 600 11.5px/1 var(--mono);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.job-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 7px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.job-counts b {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+.job-row .r-bar {
+  margin-top: 8px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.job-row .r-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+/* Active-send throughput block */
+.throughput {
+  border: 1px solid rgba(61, 83, 194, 0.3);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+  background: rgba(61, 83, 194, 0.03);
+}
+.tp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.tp-head .spacer {
+  flex: 1;
+}
+.tp-subj {
+  font: 600 13px/1.3 var(--sans);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tp-rate {
+  text-align: right;
+}
+.tp-rate b {
+  font: 600 14px/1 var(--mono);
+  color: var(--accent);
+}
+.tp-rate small {
+  display: block;
+  font-size: 9.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.tp-eta {
+  font: 600 11px/1 var(--mono);
+  color: var(--muted);
+}
+svg.spark {
+  display: block;
+  width: 100%;
+  height: 40px;
+}
+svg.spark rect {
+  fill: var(--accent);
+}
+
+/* Chapter deliverability: health score + sender-domain rows */
+.health-score {
+  margin-bottom: 14px;
+}
+.health-score b {
+  font: 900 30px/1 var(--sans);
+  color: var(--accent);
+}
+.health-score.warn b {
+  color: #b8860b;
+}
+.health-score.bad b {
+  color: #b02525;
+}
+.health-score small {
+  color: var(--muted);
+  font-size: 13px;
+  margin-left: 6px;
+}
+.health-score .g-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.health-score .g-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.health-score.warn .g-fill {
+  background: #d9a406;
+}
+.health-score.bad .g-fill {
+  background: #b02525;
+}
+.domain-list {
+  display: grid;
+  gap: 8px;
+}
+.domain-row {
+  display: grid;
+  grid-template-columns: 1.4fr repeat(4, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.domain-row:last-child {
+  border-bottom: 0;
+}
+.dm-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font: 600 13px/1.3 var(--sans);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dm-name .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.good {
+  background: #2e9e5b;
+}
+.dot.warn {
+  background: #d9a406;
+}
+.dot.bad {
+  background: #b02525;
+}
+.dm-stat {
+  text-align: right;
+}
+.dm-stat b {
+  display: block;
+  font: 600 13px/1.2 var(--mono);
+}
+.dm-stat small {
+  font-size: 9.5px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Fatigue-risk tier summary */
+.tier-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(70px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.tier {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 6px;
+  text-align: center;
+}
+.tier b {
+  display: block;
+  font: 600 18px/1.2 var(--mono);
+}
+.tier small {
+  font-size: 10.5px;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+.tier-low {
+  border-color: rgba(46, 158, 91, 0.35);
+}
+.tier-medium {
+  border-color: rgba(217, 164, 6, 0.4);
+}
+.tier-high {
+  border-color: rgba(200, 90, 30, 0.4);
+}
+.tier-critical {
+  border-color: rgba(176, 37, 37, 0.45);
+}
+.fatigue-avg {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.fatigue-avg b {
+  font-family: var(--mono);
+  color: var(--fg);
+}
+
+@media (max-width: 720px) {
+  .domain-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 /* ── tray popover window ──────────────────────────── */
 body.popover-body {
   overflow: hidden;

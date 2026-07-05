@@ -150,6 +150,131 @@ export interface NextEvent {
   cancelled?: number;
 }
 
+// ── Email lifecycle (specs/email-lifecycle) ────────────────────────────────
+// Aggregates only — no recipient lists or email addresses. Fields optional
+// because live shapes were unverifiable; the Rust cache parses defensively.
+
+export interface SendJob {
+  token: string;
+  meetup_token?: string | null;
+  subject?: string | null;
+  status?: string | null;
+  distribution_option?: string | null;
+  sent_count?: number | null;
+  pending_count?: number | null;
+  suppressed_count?: number | null;
+  intended_count?: number | null;
+  delivered_percent?: number | null;
+  observed_rate?: number | null;
+  predicted_finish?: string | null;
+  done?: boolean;
+  fetched_at?: string;
+}
+
+// Aggregate send accounting for an event (email_send_jobs_summary).
+export interface EmailSummary {
+  send_jobs_count?: number;
+  sent_count?: number;
+  intended_recipient_count?: number;
+  pending_count?: number;
+  suppressed_count?: number;
+  pre_send_excluded_count?: number;
+  status_counts?: Record<string, number>;
+  first_sent_at?: string;
+  last_sent_at?: string;
+  [k: string]: unknown;
+}
+
+// Campaign open/click performance (email_campaign_performance_get → summary).
+export interface CampaignPerformance {
+  summary?: {
+    sends?: number;
+    delivered?: number;
+    delivery_rate?: number;
+    opens?: number;
+    open_rate?: number;
+    clicks?: number;
+    click_rate?: number;
+    bounces?: number;
+    bounce_rate?: number;
+    unsubscribes?: number;
+    unsubscribe_rate?: number;
+    [k: string]: unknown;
+  } | null;
+  [k: string]: unknown;
+}
+
+export interface EventEmail {
+  meetup_token?: string;
+  summary?: EmailSummary | null;
+  campaign?: CampaignPerformance | null;
+  send_jobs: SendJob[];
+  unavailable?: boolean;
+  reason?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ThroughputBucket {
+  bucket_start?: string;
+  sent_count?: number;
+}
+
+export interface SendProgress {
+  observed_send_rate_per_minute?: number;
+  predicted_finish_at?: string;
+  [k: string]: unknown;
+}
+
+export interface Throughput {
+  token?: string;
+  throughput?: ThroughputBucket[] | null;
+  progress?: SendProgress | null;
+  peak_rate?: number | null;
+  average_rate?: number | null;
+  total_sent?: number | null;
+  done?: boolean;
+  updated_at?: string | null;
+}
+
+export interface SenderDomain {
+  domain?: string;
+  sent?: number;
+  delivered?: number;
+  bounce_rate?: number;
+  complaint_rate?: number;
+  unsubscribe_rate?: number;
+  status?: string;
+}
+
+export interface DeliverabilityHealth {
+  health_score?: number;
+  sender_domains?: SenderDomain[];
+  alerts?: { severity?: string; code?: string; message?: string }[];
+  [k: string]: unknown;
+}
+
+// Fatigue tier summary only (no per-subscriber rows).
+export interface FatigueTierSummary {
+  summary?: {
+    counts_by_tier?: Record<string, number>;
+    by_tier?: Record<string, number>;
+    average_fatigue_score?: number;
+    evaluated?: number;
+    [k: string]: unknown;
+  } | null;
+  truncated?: boolean;
+}
+
+export interface ChapterDeliverability {
+  health?: DeliverabilityHealth | null;
+  fatigue?: FatigueTierSummary | null;
+  recent_jobs: SendJob[];
+  truncated?: boolean;
+  unavailable?: boolean;
+  reason?: string | null;
+  updated_at?: string | null;
+}
+
 // Typed error surfaced from Rust (error envelope code + message).
 export interface AppErr {
   code: string;

@@ -2,7 +2,15 @@
 // directly — all API access and caching live in Rust (design D2).
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { EventObj, EventsPayload, Identity, NextEvent } from "./types";
+import type {
+  ChapterDeliverability,
+  EventEmail,
+  EventObj,
+  EventsPayload,
+  Identity,
+  NextEvent,
+  Throughput,
+} from "./types";
 
 export function validateAndStore(key: string): Promise<Identity> {
   return invoke("validate_and_store", { key });
@@ -40,6 +48,25 @@ export function getNextEvent(): Promise<NextEvent | null> {
   return invoke("get_next_event");
 }
 
+// ── Email lifecycle (specs/email-lifecycle) ────────────────────────────────
+
+export function getEventEmail(meetupToken: string): Promise<EventEmail> {
+  return invoke("get_event_email", { meetupToken });
+}
+
+export function getSendJobThroughput(token: string): Promise<Throughput | null> {
+  return invoke("get_send_job_throughput", { token });
+}
+
+export function getChapterDeliverability(): Promise<ChapterDeliverability> {
+  return invoke("get_chapter_deliverability");
+}
+
+/** Trigger a manual email fetch: an event's send data, or (no token) the chapter. */
+export function refreshEmail(meetupToken?: string): Promise<void> {
+  return invoke("refresh_email", { meetupToken: meetupToken ?? null });
+}
+
 export function setNotificationsEnabled(enabled: boolean): Promise<void> {
   return invoke("set_notifications_enabled", { enabled });
 }
@@ -69,4 +96,16 @@ export function onDetailUpdated(cb: (meetupToken: string) => void): Promise<Unli
 
 export function onPopoverData(cb: (data: NextEvent | null) => void): Promise<UnlistenFn> {
   return listen<NextEvent | null>("popover:data", (e) => cb(e.payload));
+}
+
+// Emitted when an event's email data finishes syncing.
+export function onEmailEvent(cb: (meetupToken: string) => void): Promise<UnlistenFn> {
+  return listen<{ meetup_token: string }>("email:event", (e) =>
+    cb(e.payload.meetup_token),
+  );
+}
+
+// Emitted when the chapter deliverability surface finishes syncing.
+export function onEmailChapter(cb: () => void): Promise<UnlistenFn> {
+  return listen("email:chapter", cb);
 }

@@ -1,9 +1,35 @@
 // Event detail (specs/event-detail): RSVP summary, awaiting-payment,
 // performance, and gallery. Renders instantly from cache, then refreshes
 // per-event scoped data (performance + awaiting) in the background.
-import { fetchEventDetail, getEventDetail } from "../api";
-import type { AwaitingRow, EventObj, GalleryPhoto } from "../types";
+import {
+  fetchEventDetail,
+  getEventDetail,
+  getEventEmail,
+  getSendJobThroughput,
+  refreshEmail,
+} from "../api";
+import type {
+  AwaitingRow,
+  CampaignPerformance,
+  EventEmail,
+  EventObj,
+  GalleryPhoto,
+  SendJob,
+  Throughput,
+} from "../types";
 import { byId, esc, fmt, num } from "../util";
+import {
+  emailBlockedHTML,
+  fmtRate,
+  sendJobRowHTML,
+  statusChip,
+  throughputSparkHTML,
+} from "./email";
+
+// Active-send polling cadence — the gentlest value that still feels live
+// (design D3 open question). Only runs while the panel is open AND a job is
+// active; it stops as soon as every job is completed/failed.
+const ACTIVE_POLL_MS = 60_000;
 
 interface DetailOpts {
   onBack: () => void;
@@ -18,8 +44,23 @@ export interface DetailController {
 export function mountDetail(opts: DetailOpts): DetailController {
   const root = byId("scr-detail");
   let current: string | null = null;
+  let email: EventEmail | null = null;
+  let throughput = new Map<string, Throughput>();
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  function stopPolling(): void {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
 
   async function open(meetupToken: string): Promise<void> {
+    if (meetupToken !== current) {
+      stopPolling();
+      email = null;
+      throughput = new Map();
+    }
     current = meetupToken;
     const cached = await getEventDetail(meetupToken);
     if (cached) render(cached);
@@ -32,6 +73,16 @@ export function mountDetail(opts: DetailOpts): DetailController {
     } catch {
       /* keep cached render */
     }
+
+    // Load cached email first (instant), then trigger a fetch + repaint.
+    await loadEmail(meetupToken);
+    try {
+      await refreshEmail(meetupToken);
+      await loadEmail(meetupToken);
+    } catch {
+      /* keep cached email render */
+    }
+    scheduleActivePolling(meetupToken);
   }
 
   // Cache-only re-render for background "detail:updated" events. Must NOT call
@@ -41,6 +92,43 @@ export function mountDetail(opts: DetailOpts): DetailController {
     if (meetupToken !== current) return;
     const cached = await getEventDetail(meetupToken);
     if (cached && meetupToken === current) render(cached);
+    await loadEmail(meetupToken);
+  }
+
+  // Pull cached email + throughput for active jobs and repaint the panel.
+  async function loadEmail(meetupToken: string): Promise<void> {
+    try {
+      const e = await getEventEmail(meetupToken);
+      if (current !== meetupToken) return;
+      email = e;
+      for (const j of activeJobs(e)) {
+        const t = await getSendJobThroughput(j.token);
+        if (current !== meetupToken) return;
+        if (t) throughput.set(j.token, t);
+      }
+    } catch {
+      /* leave prior email state */
+    }
+    paintEmail();
+  }
+
+  // Poll active sends on a gentle cadence; stop once none are active (spec).
+  function scheduleActivePolling(meetupToken: string): void {
+    stopPolling();
+    if (!email || !activeJobs(email).length) return;
+    pollTimer = setInterval(async () => {
+      if (current !== meetupToken) {
+        stopPolling();
+        return;
+      }
+      try {
+        await refreshEmail(meetupToken);
+        await loadEmail(meetupToken);
+      } catch {
+        /* transient; try again next tick */
+      }
+      if (!email || !activeJobs(email).length) stopPolling();
+    }, ACTIVE_POLL_MS);
   }
 
   function render(ev: EventObj): void {
@@ -51,10 +139,29 @@ export function mountDetail(opts: DetailOpts): DetailController {
         <span class="spacer"></span>
       </div>
       <div class="content">${bodyHTML(ev)}</div>`;
-    byId<HTMLButtonElement>("backBtn").addEventListener("click", opts.onBack);
+    byId<HTMLButtonElement>("backBtn").addEventListener("click", () => {
+      stopPolling();
+      opts.onBack();
+    });
+    paintEmail();
+  }
+
+  // The email panel loads asynchronously from the event body, so it fills a
+  // dedicated slot rather than forcing a full detail re-render.
+  function paintEmail(): void {
+    const slot = document.getElementById("emailSlot");
+    if (!slot) return;
+    slot.innerHTML = emailPanelHTML(email, throughput);
   }
 
   return { open, refresh };
+}
+
+function activeJobs(e: EventEmail | null): SendJob[] {
+  if (!e || !e.send_jobs) return [];
+  return e.send_jobs.filter(
+    (j) => !j.done && ["queued", "sending", "active"].includes((j.status ?? "").toLowerCase()),
+  );
 }
 
 function bodyHTML(ev: EventObj): string {
@@ -113,9 +220,110 @@ function bodyHTML(ev: EventObj): string {
       ${rsvpPanel}
       ${payPanel || perfPanel}
       ${payPanel ? perfPanel : ""}
+      <div id="emailSlot" style="grid-column:1/-1"></div>
       ${gallery}
     </div>
     <div class="lastsync-foot">${foot}</div>`;
+}
+
+// Per-event Email panel (specs/email-lifecycle): send-job status + delivery
+// accounting, active-send throughput, and open/click performance. Renders only
+// from cached commands; degrades (subscribers group / city-owner) without error.
+function emailPanelHTML(email: EventEmail | null, throughput: Map<string, Throughput>): string {
+  if (!email) return "";
+  if (email.unavailable) {
+    return `<div class="panel"><h4>Email</h4>${emailBlockedHTML(email.reason)}</div>`;
+  }
+  const jobs = email.send_jobs ?? [];
+  const s = email.summary ?? null;
+  const hasAny = jobs.length > 0 || (s && (num(s.sent_count) > 0 || num(s.send_jobs_count) > 0));
+  if (!hasAny) {
+    return `<div class="panel"><h4>Email</h4>
+      <div class="not-enabled">No email sent for this event yet.</div></div>`;
+  }
+
+  // Aggregate delivery accounting from the send-job summary.
+  const accounting = s
+    ? `<div class="email-stats">
+         ${statTile("Sent", fmt(s.sent_count))}
+         ${statTile("Intended", fmt(s.intended_recipient_count))}
+         ${statTile("Pending", fmt(s.pending_count))}
+         ${statTile("Suppressed", fmt(s.suppressed_count))}
+       </div>`
+    : "";
+
+  // Active-send throughput (one block per active job), else frozen final counts.
+  const active = jobs.filter(
+    (j) => !j.done && ["queued", "sending", "active"].includes((j.status ?? "").toLowerCase()),
+  );
+  const throughputHTML = active
+    .map((j) => throughputBlock(j, throughput.get(j.token)))
+    .join("");
+
+  const jobList = jobs.length
+    ? `<div class="job-list">${jobs.map((j) => sendJobRowHTML(j)).join("")}</div>`
+    : "";
+
+  const perf = campaignHTML(email.campaign ?? null);
+
+  return `<div class="panel">
+    <h4>Email ${active.length ? `<span class="b-count live">${fmt(active.length)} active</span>` : ""}</h4>
+    ${accounting}
+    ${throughputHTML}
+    ${jobList}
+    ${perf}
+  </div>`;
+}
+
+function throughputBlock(j: SendJob, t?: Throughput): string {
+  const buckets = t?.throughput ?? [];
+  const spark = buckets.length ? throughputSparkHTML(buckets) : "";
+  const observed =
+    t?.progress?.observed_send_rate_per_minute ?? j.observed_rate ?? null;
+  const rate =
+    typeof observed === "number" ? `${fmt(Math.round(observed))}/min` : "—";
+  const finish = t?.progress?.predicted_finish_at ?? j.predicted_finish ?? null;
+  const eta = finish ? `ETA ${esc(shortTime(finish))}` : "predicting…";
+  return `<div class="throughput">
+    <div class="tp-head">
+      ${statusChip(j.status, j.done)}
+      <span class="tp-subj">${esc(j.subject ?? "(no subject)")}</span>
+      <span class="spacer"></span>
+      <span class="tp-rate"><b>${rate}</b><small>observed</small></span>
+      <span class="tp-eta">${eta}</span>
+    </div>
+    ${spark}
+  </div>`;
+}
+
+function campaignHTML(c: CampaignPerformance | null): string {
+  const sum = c?.summary ?? null;
+  // Performance is optional enrichment — omit the section entirely when absent
+  // (spec: still show send accounting, don't error).
+  if (!sum) return "";
+  const hasRates =
+    sum.delivery_rate != null ||
+    sum.open_rate != null ||
+    sum.click_rate != null;
+  if (!hasRates) return "";
+  return `<div class="email-perf">
+    <div class="ep-title">Open / click performance</div>
+    <div class="email-stats">
+      ${statTile("Delivery", fmtRate(sum.delivery_rate))}
+      ${statTile("Open rate", fmtRate(sum.open_rate))}
+      ${statTile("Click rate", fmtRate(sum.click_rate))}
+    </div>
+  </div>`;
+}
+
+function statTile(label: string, value: string): string {
+  return `<div class="stat-tile"><b>${esc(value)}</b><small>${esc(label)}</small></div>`;
+}
+
+function shortTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  return new Date(t).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
 
 // Public event page (event-page-view): rendered inert (no scripts/active forms),
