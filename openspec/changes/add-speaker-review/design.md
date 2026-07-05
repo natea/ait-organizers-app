@@ -7,8 +7,7 @@ through Tauri commands (`commands.rs`). The frontend is vanilla TS + Vite in `sr
 styled from `design/DESIGN.md`.
 
 Speaker curation — reviewing submitted talk proposals and approving the lineup — lives
-entirely outside the app today. Network-wide there are 5,635 submitted talks, 3,301
-approved, and 11,939 speaker-review alerts, so this is a high-volume programming task.
+entirely outside the app today, and it is a high-volume programming task network-wide.
 The API already computes a ranked speaker-candidate pool
 (`speaker_pipeline_candidates_get`) and exposes talk submissions through `rsvp_search`
 (with `speaker_status` / `speaker_approval_status`) and `rsvp_get`.

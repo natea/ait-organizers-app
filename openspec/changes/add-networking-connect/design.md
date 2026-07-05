@@ -7,8 +7,8 @@ feature alongside `add-rsvp-screening`, so it must introduce and share a single 
 guardrail rather than scatter mutation logic per screen.
 
 The Networking / Connect surface targets the gap identified in the stack-rank: strong
-email engagement but weak in-product posting (64 board posts against 2,052 views
-network-wide). Organizers already live in Mission Control for events; bringing chapter
+email engagement but weak in-product posting. Organizers already live in Mission
+Control for events; bringing chapter
 message boards into the same app lets them see mentions and posts needing a response,
 then post, reply, react, and DM members without a context switch.
 

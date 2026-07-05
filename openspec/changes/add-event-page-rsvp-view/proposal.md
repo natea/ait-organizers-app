@@ -1,7 +1,6 @@
 # Proposal: add-event-page-rsvp-view
 
-Stack-rank #1 — Public event page + RSVP flow (biggest usage by far: 2.18M
-event/content page views, 155k RSVPs network-wide).
+Stack-rank #1 — Public event page + RSVP flow (the highest-usage surface across the network).
 
 ## Why
 

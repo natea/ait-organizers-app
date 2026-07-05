@@ -1,7 +1,6 @@
 # Proposal: add-media-video-kit
 
-Stack-rank #9 — Media upload / video kit (important for post-event content, lower
-observed event usage: 387 uploads, 301 complete, 119 folders network-wide).
+Stack-rank #9 — Media upload / video kit (important for post-event content, but a lower-usage surface).
 
 ## Why
 

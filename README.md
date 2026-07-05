@@ -5,6 +5,22 @@ ambient, always-current view of their upcoming events: RSVP funnels, capacity,
 awaiting-payment stragglers, performance, and a menubar widget with live counts
 and change notifications. Built on the [AI Tinkerers Agents API](https://aitinkerers.org/api/agents/v1/openapi.yaml).
 
+## Screenshots
+
+**Events overview** — upcoming events with RSVP funnel, capacity gauge, and countdown:
+
+![Events overview](docs/screenshots/overview.png)
+
+**Past tab** — concluded events with held-date recap and final counts:
+
+![Past events](docs/screenshots/past.png)
+
+**Event detail** — RSVP summary, performance (page views / real check-ins / conversion), and gallery:
+
+![Event detail](docs/screenshots/detail.png)
+
+> Screenshots use representative sample data.
+
 ## Stack
 
 - **Tauri 2** native shell (Rust) — owns keychain, HTTP, SQLite cache, poll scheduler, tray.

@@ -1,7 +1,6 @@
 # Proposal: add-attendance-checkin
 
-Stack-rank #4 — Attendance confirmation + check-in (strong hybrid member/organizer
-workflow: 47k attendance prompts, 6,591 confirmations, 6,793 QR scans network-wide).
+Stack-rank #4 — Attendance confirmation + check-in (a heavily-used hybrid member/organizer workflow).
 
 ## Why
 

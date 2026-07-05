@@ -1,8 +1,6 @@
 # Proposal: add-promotion-tools
 
-Stack-rank #8 — Promotion tools: banners, social, speaker promo (useful but
-smaller volume: 3,231 content-page image uploads, 2,000 promo banners, 985
-speaker-badge emails network-wide).
+Stack-rank #8 — Promotion tools: banners, social, speaker promo (useful to organizers but a smaller-volume surface).
 
 ## Why
 

@@ -1,7 +1,6 @@
 # Proposal: add-survey-followup
 
-Stack-rank #7 — Survey + post-event follow-up (large outbound volume, moderate
-action depth: 168k survey/follow-up emails, 25k survey alerts network-wide).
+Stack-rank #7 — Survey + post-event follow-up (large outbound volume, moderate action depth).
 
 ## Why
 

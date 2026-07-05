@@ -7,8 +7,7 @@ commands (`commands.rs`) that the vanilla-TS frontend (`src/`) renders from. Scr
 render **only** from the SQLite cache; the network layer (`api.rs` / `sync.rs`) is the
 sole writer of that cache.
 
-Sponsorship funds chapters. Usage is niche (621 sponsor assessments overall, 10 in NYC;
-export/share activity is very low) but high value per use. This change adds a sponsor
+Sponsorship funds chapters. Usage is niche but high value per use. This change adds a sponsor
 workbench: find sponsors, list their contacts, generate an AI research brief on a
 company, and draft a tailored pitch that folds in event context. It is the app's first
 feature to call **generation** endpoints; every prior feature is read-only.

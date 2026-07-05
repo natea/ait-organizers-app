@@ -1,7 +1,6 @@
 # Proposal: add-sponsor-tools
 
-Stack-rank #10 — Sponsor tools (niche but high-value when used: 621 sponsor
-assessments overall, 10 in NYC; export/share activity is very low).
+Stack-rank #10 — Sponsor tools (niche but high-value when used).
 
 ## Why
 
