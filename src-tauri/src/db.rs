@@ -25,6 +25,7 @@ pub fn init(conn: &Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS rsvp_summaries (
             meetup_token  TEXT PRIMARY KEY,
             total_count   INTEGER,
+            checked_in    INTEGER,
             groups_json   TEXT,
             updated_at    TEXT NOT NULL
         );
@@ -61,6 +62,9 @@ pub fn init(conn: &Connection) -> AppResult<()> {
         "ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'upcoming'",
         [],
     );
+    // Real check-in count (rsvps/summary status=checked_in). ALTER errors on
+    // already-migrated DBs — ignore.
+    let _ = conn.execute("ALTER TABLE rsvp_summaries ADD COLUMN checked_in INTEGER", []);
     Ok(())
 }
 
@@ -208,17 +212,25 @@ pub fn upsert_summary(
     conn: &Connection,
     meetup_token: &str,
     total_count: i64,
+    checked_in: Option<i64>,
     groups: Option<&Value>,
     now: &str,
 ) -> AppResult<()> {
     conn.execute(
-        "INSERT INTO rsvp_summaries (meetup_token, total_count, groups_json, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO rsvp_summaries (meetup_token, total_count, checked_in, groups_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(meetup_token) DO UPDATE SET
            total_count=excluded.total_count,
+           checked_in=COALESCE(excluded.checked_in, rsvp_summaries.checked_in),
            groups_json=excluded.groups_json,
            updated_at=excluded.updated_at",
-        params![meetup_token, total_count, groups.map(|v| v.to_string()), now],
+        params![
+            meetup_token,
+            total_count,
+            checked_in,
+            groups.map(|v| v.to_string()),
+            now
+        ],
     )?;
     Ok(())
 }
@@ -296,12 +308,13 @@ pub fn get_event_detail(conn: &Connection, meetup_token: &str) -> AppResult<Opti
 
     let summary = conn
         .query_row(
-            "SELECT total_count, groups_json FROM rsvp_summaries WHERE meetup_token = ?1",
+            "SELECT total_count, checked_in, groups_json FROM rsvp_summaries WHERE meetup_token = ?1",
             params![meetup_token],
             |r| {
                 Ok(json!({
                     "total_count": r.get::<_, i64>(0)?,
-                    "groups": r.get::<_, Option<String>>(1)?
+                    "checked_in": r.get::<_, Option<i64>>(1)?,
+                    "groups": r.get::<_, Option<String>>(2)?
                         .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
                 }))
             },

@@ -50,32 +50,22 @@ function bodyHTML(ev: EventObj): string {
   const isPast = (ev.kind ?? "upcoming") === "past";
   const r = ev.rsvps ?? {};
   const days = num(ev.days_until_event_in_event_timezone);
-  const total = Math.max(num(r.registered), num(r.attending) + num(r.waitlisted) + num(r.cancelled), 1);
 
-  // Check-in count comes from the performance aggregate (rsvps.completed) when
-  // in scope; otherwise fall back to final attending.
-  const completed = ev.performance?.perf?.rsvps?.completed;
-  const attended = typeof completed === "number" ? completed : num(r.attending);
+  // Total from the RSVP summary (attending + waitlisted + cancelled); the API's
+  // `registered` field is 0 for these events, so it is not shown.
+  const total =
+    ev.rsvp_summary?.total_count ??
+    num(r.attending) + num(r.waitlisted) + num(r.cancelled);
+  const scale = Math.max(total, 1);
 
-  const rsvpPanel = isPast
-    ? `
+  const rsvpPanel = `
     <div class="panel">
-      <h4>RSVP summary — final</h4>
+      <h4>RSVP summary${isPast ? " — final" : ""}</h4>
       <div class="rsvp-rows">
-        ${rsvpRow("Registered", num(r.registered), total, true)}
-        ${rsvpRow("Attending", num(r.attending), total, false)}
-        ${rsvpRow("Attended", attended, total, false)}
-        ${rsvpRow("Cancelled", num(r.cancelled), total, true)}
-      </div>
-    </div>`
-    : `
-    <div class="panel">
-      <h4>RSVP summary</h4>
-      <div class="rsvp-rows">
-        ${rsvpRow("Registered", num(r.registered), total, true)}
-        ${rsvpRow("Attending", num(r.attending), total, false)}
-        ${rsvpRow("Waitlisted", num(r.waitlisted), total, true)}
-        ${rsvpRow("Cancelled", num(r.cancelled), total, true)}
+        ${rsvpRow("Total", total, scale, true)}
+        ${rsvpRow("Attending", num(r.attending), scale, false)}
+        ${rsvpRow("Waitlisted", num(r.waitlisted), scale, true)}
+        ${rsvpRow("Cancelled", num(r.cancelled), scale, true)}
       </div>
     </div>`;
 
@@ -175,14 +165,25 @@ function performancePanel(ev: EventObj, isPast = false): string {
   }
   const views = num(row.traffic?.page_views);
   const completed = num(row.rsvps?.completed);
+  // Real door check-in count (rsvps/summary status=checked_in) — the true
+  // attendance number, distinct from "completed RSVPs" (attending + waitlisted).
+  const checkedIn = ev.rsvp_summary?.checked_in;
   const conv = row.conversion?.completed_rsvps_per_page_view;
-  const convPct = typeof conv === "number" ? `${(conv * 100).toFixed(1)}%` : "—";
+  // Only show conversion when it's a sane fraction (a >100% value means the
+  // traffic window is off, so suppress rather than mislead).
+  const showConv = typeof conv === "number" && conv >= 0 && conv <= 1;
+
+  const attendanceRow =
+    typeof checkedIn === "number"
+      ? statRow("Checked in", fmt(checkedIn))
+      : statRow("Completed RSVPs", fmt(completed));
+
   return `<div class="panel">
     <h4>${title}</h4>
     <div class="rsvp-rows">
       ${statRow("Page views", fmt(views))}
-      ${statRow(isPast ? "Checked in" : "Completed RSVPs", fmt(completed))}
-      ${statRow("Conversion", convPct)}
+      ${attendanceRow}
+      ${showConv ? statRow("Conversion", `${(conv! * 100).toFixed(1)}%`) : ""}
     </div></div>`;
 }
 

@@ -167,13 +167,20 @@ function upcomingCardHTML(ev: EventObj): string {
       <div class="count ${countdown.past ? "past" : ""}"><b>${esc(countdown.big)}</b><small>${esc(countdown.small)}</small></div>
     </div>
     ${gauge}
-    <div class="funnel">
-      <div><b>${fmt(r.registered)}</b><small>Registered</small></div>
-      <div><b>${fmt(r.attending)}</b><small>Attending</small></div>
-      <div><b>${fmt(r.waitlisted)}</b><small>Waitlisted</small></div>
-      <div><b>${fmt(r.cancelled)}</b><small>Cancelled</small></div>
-    </div>
+    ${funnelHTML(r)}
   </button>`;
+}
+
+// The API's `registered` field is 0 for these events, so the funnel shows a
+// computed Total (attending + waitlisted + cancelled) instead.
+function funnelHTML(r: EventObj["rsvps"] = {}): string {
+  const total = num(r.attending) + num(r.waitlisted) + num(r.cancelled);
+  return `<div class="funnel">
+    <div><b>${fmt(total)}</b><small>Total</small></div>
+    <div><b>${fmt(r.attending)}</b><small>Attending</small></div>
+    <div><b>${fmt(r.waitlisted)}</b><small>Waitlisted</small></div>
+    <div><b>${fmt(r.cancelled)}</b><small>Cancelled</small></div>
+  </div>`;
 }
 
 // Past card: "held" chip instead of a countdown, and an Attended cell in place
@@ -188,7 +195,7 @@ function pastCardHTML(ev: EventObj): string {
 
   const gauge =
     capacity && capacity > 0
-      ? gaugeHTML(attending, capacity, "attended")
+      ? gaugeHTML(attending, capacity, "attending")
       : `<div class="nogauge">No capacity set — final counts below</div>`;
 
   return `<button class="ev" data-id="${esc(ev.meetup_token)}">
@@ -201,12 +208,7 @@ function pastCardHTML(ev: EventObj): string {
       <div class="count held"><b>${esc(heldLabel(ev))}</b><small>held</small></div>
     </div>
     ${gauge}
-    <div class="funnel">
-      <div><b>${fmt(r.registered)}</b><small>Registered</small></div>
-      <div><b>${fmt(r.attending)}</b><small>Attending</small></div>
-      <div><b>${fmt(attending)}</b><small>Attended</small></div>
-      <div><b>${fmt(r.cancelled)}</b><small>Cancelled</small></div>
-    </div>
+    ${funnelHTML(r)}
   </button>`;
 }
 

@@ -64,7 +64,13 @@ export interface EventObj {
     results?: AwaitingRow[] | null;
     unavailable?: boolean;
   } | null;
-  rsvp_summary?: { total_count?: number; groups?: unknown } | null;
+  rsvp_summary?: {
+    total_count?: number;
+    // Real door check-in count (rsvps/summary status=checked_in); null when
+    // not yet fetched or out of scope.
+    checked_in?: number | null;
+    groups?: unknown;
+  } | null;
 }
 
 export interface AwaitingRow {

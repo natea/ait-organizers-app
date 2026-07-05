@@ -102,24 +102,6 @@ impl ApiClient {
         .await
     }
 
-    /// Aggregate performance row(s) for one chapter/date range.
-    pub async fn performance(
-        &self,
-        weblog_token: &str,
-        date_from: &str,
-        date_to: &str,
-    ) -> AppResult<ApiOk> {
-        self.call(
-            "meetups/performance",
-            json!({
-                "weblog_token": weblog_token,
-                "date_from": date_from,
-                "date_to": date_to,
-            }),
-        )
-        .await
-    }
-
     /// RSVPs awaiting Stripe payment for a paid event.
     pub async fn awaiting_payment(&self, meetup_token: &str) -> AppResult<ApiOk> {
         self.call(
@@ -133,6 +115,40 @@ impl ApiClient {
     pub async fn rsvp_summary(&self, meetup_token: &str) -> AppResult<ApiOk> {
         self.call("rsvps/summary", json!({ "meetup_token": meetup_token }))
             .await
+    }
+
+    /// Count of RSVPs actually checked in at the door. `rsvps/summary` with
+    /// `status=checked_in` returns this as `total_count` — the true attendance
+    /// number (distinct from "completed RSVPs" = attending + waitlisted).
+    pub async fn rsvp_checked_in_count(&self, meetup_token: &str) -> AppResult<ApiOk> {
+        self.call(
+            "rsvps/summary",
+            json!({ "meetup_token": meetup_token, "status": "checked_in" }),
+        )
+        .await
+    }
+
+    /// Aggregate performance with an explicit traffic window, so page views
+    /// reflect real cumulative traffic rather than a single event-day.
+    pub async fn performance_windowed(
+        &self,
+        weblog_token: &str,
+        date_from: &str,
+        date_to: &str,
+        traffic_from: &str,
+        traffic_to: &str,
+    ) -> AppResult<ApiOk> {
+        self.call(
+            "meetups/performance",
+            json!({
+                "weblog_token": weblog_token,
+                "date_from": date_from,
+                "date_to": date_to,
+                "traffic_from": traffic_from,
+                "traffic_to": traffic_to,
+            }),
+        )
+        .await
     }
 }
 

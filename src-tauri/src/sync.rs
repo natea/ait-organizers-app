@@ -342,17 +342,18 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
 
     let now = iso_now();
 
-    // Performance (aggregate row) — degrade on scope/group blocks.
+    // Performance (aggregate row) — degrade on scope/group blocks. The traffic
+    // window spans the ~6 months up to the event so page views reflect real
+    // cumulative traffic, not just the single event-day (fixes >100% conversion).
     if !weblog_token.is_empty() && !event_date.is_empty() {
-        let traffic_from = (Utc::now() - Duration::days(120))
-            .format("%Y-%m-%d")
-            .to_string();
+        let traffic_from = chrono::NaiveDate::parse_from_str(&event_date, "%Y-%m-%d")
+            .map(|d| (d - Duration::days(180)).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| event_date.clone());
         match api
-            .performance(&weblog_token, &event_date, &event_date)
+            .performance_windowed(&weblog_token, &event_date, &event_date, &traffic_from, &event_date)
             .await
         {
             Ok(ok) => {
-                let _ = traffic_from;
                 let row = ok
                     .data
                     .get("events")
@@ -397,13 +398,18 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
         }
     }
 
-    // Summary count (best-effort).
+    // RSVP total + real door check-in count (best-effort). The check-in count
+    // is the true attendance figure; `performance.completed` is not.
     if let Ok(ok) = api.rsvp_summary(meetup_token).await {
         let total = ok.data.get("total_count").and_then(Value::as_i64).unwrap_or(0);
         let groups = ok.data.get("groups").cloned();
+        let checked_in = match api.rsvp_checked_in_count(meetup_token).await {
+            Ok(c) => c.data.get("total_count").and_then(Value::as_i64),
+            Err(_) => None,
+        };
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
-        let _ = db::upsert_summary(&conn, meetup_token, total, groups.as_ref(), &now);
+        let _ = db::upsert_summary(&conn, meetup_token, total, checked_in, groups.as_ref(), &now);
     }
 
     let _ = app.emit("detail:updated", json!({ "meetup_token": meetup_token }));
