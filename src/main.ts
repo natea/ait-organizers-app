@@ -43,7 +43,9 @@ async function boot(): Promise<void> {
     overview?.reload();
   });
   await onDetailUpdated((token) => {
-    if (token === currentDetailToken) detail?.open(token);
+    // Re-render from cache only. Calling open() here would re-fetch, which
+    // re-emits "detail:updated" → infinite loop (logo flicker + API hammering).
+    if (token === currentDetailToken) detail?.refresh(token);
   });
 
   let onboarded = false;
