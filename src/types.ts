@@ -71,6 +71,40 @@ export interface EventObj {
     checked_in?: number | null;
     groups?: unknown;
   } | null;
+  // Public content page + email metrics (event-page-view).
+  content_page?: {
+    page?: ContentPage | null;
+    metrics?: ContentPageMetrics | null;
+    unavailable?: boolean;
+    reason?: string | null;
+  } | null;
+}
+
+// Rendered public event page. Fields parsed defensively (the API returns a
+// single article payload with body markdown/text + editorial metadata).
+export interface ContentPage {
+  title?: string;
+  name?: string;
+  body_markdown?: string;
+  body_text?: string;
+  content_text?: string;
+  plain_text?: string;
+  author?: string;
+  author_name?: string;
+  editorial_status?: string;
+  status?: string;
+  public_url?: string;
+  url?: string;
+  published_at?: string;
+  updated_at?: string;
+  [k: string]: unknown;
+}
+
+export interface ContentPageMetrics {
+  sends?: number;
+  opens?: number;
+  clicks?: number;
+  [k: string]: unknown;
 }
 
 export interface AwaitingRow {

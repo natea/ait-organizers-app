@@ -54,6 +54,15 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             unavailable    INTEGER NOT NULL DEFAULT 0,
             note           TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS content_pages (
+            meetup_token  TEXT PRIMARY KEY,
+            page_json     TEXT,
+            metrics_json  TEXT,
+            unavailable   INTEGER NOT NULL DEFAULT 0,
+            reason        TEXT,
+            updated_at    TEXT NOT NULL
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -321,12 +330,61 @@ pub fn get_event_detail(conn: &Connection, meetup_token: &str) -> AppResult<Opti
         )
         .optional()?;
 
+    let content_page = conn
+        .query_row(
+            "SELECT page_json, metrics_json, unavailable, reason FROM content_pages WHERE meetup_token = ?1",
+            params![meetup_token],
+            |r| {
+                Ok(json!({
+                    "page": r.get::<_, Option<String>>(0)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "metrics": r.get::<_, Option<String>>(1)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "unavailable": r.get::<_, i64>(2)? != 0,
+                    "reason": r.get::<_, Option<String>>(3)?,
+                }))
+            },
+        )
+        .optional()?;
+
     if let Value::Object(ref mut map) = event {
         map.insert("performance".into(), perf.unwrap_or(Value::Null));
         map.insert("awaiting_payment".into(), awaiting.unwrap_or(Value::Null));
         map.insert("rsvp_summary".into(), summary.unwrap_or(Value::Null));
+        map.insert("content_page".into(), content_page.unwrap_or(Value::Null));
     }
     Ok(Some(event))
+}
+
+/// Cache the content page + email metrics for an event (specs/event-page-view).
+pub fn upsert_content_page(
+    conn: &Connection,
+    meetup_token: &str,
+    page: Option<&Value>,
+    metrics: Option<&Value>,
+    unavailable: bool,
+    reason: Option<&str>,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO content_pages (meetup_token, page_json, metrics_json, unavailable, reason, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(meetup_token) DO UPDATE SET
+           page_json=COALESCE(excluded.page_json, content_pages.page_json),
+           metrics_json=COALESCE(excluded.metrics_json, content_pages.metrics_json),
+           unavailable=excluded.unavailable,
+           reason=excluded.reason,
+           updated_at=excluded.updated_at",
+        params![
+            meetup_token,
+            page.map(|v| v.to_string()),
+            metrics.map(|v| v.to_string()),
+            unavailable as i64,
+            reason,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn set_sync_state(

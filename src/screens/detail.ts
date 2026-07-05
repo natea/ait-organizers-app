@@ -83,6 +83,7 @@ function bodyHTML(ev: EventObj): string {
   // Past events aren't awaiting payment; show performance recap instead.
   const payPanel = !isPast && ev.stripe_payment_link_active ? awaitingPanel(ev) : "";
   const perfPanel = performancePanel(ev, isPast);
+  const pagePanel = eventPagePanel(ev);
   const gallery = galleryPanel(ev.gallery_preview);
 
   const org = ev.organizer?.name ? ` · Organizer ${esc(ev.organizer.name)}` : "";
@@ -108,12 +109,61 @@ function bodyHTML(ev: EventObj): string {
       ${chip}
     </div>
     <div class="d-grid">
+      ${pagePanel}
       ${rsvpPanel}
       ${payPanel || perfPanel}
       ${payPanel ? perfPanel : ""}
       ${gallery}
     </div>
     <div class="lastsync-foot">${foot}</div>`;
+}
+
+// Public event page (event-page-view): rendered inert (no scripts/active forms),
+// with editorial metadata, email metrics, and a deep link to the live page.
+function eventPagePanel(ev: EventObj): string {
+  const cp = ev.content_page;
+  // Not yet fetched (no token or background fetch pending): omit; it appears
+  // once fetch_event_detail refreshes the cache.
+  if (!cp) return "";
+  if (cp.unavailable) {
+    return `<div class="panel" style="grid-column:1/-1"><h4>Event page</h4>
+      <div class="not-enabled"><b>Not enabled for your chapter</b>
+        The content-pages API group is switched off (or out of scope) for this weblog.</div></div>`;
+  }
+  const page = cp.page;
+  if (!page) {
+    return `<div class="panel" style="grid-column:1/-1"><h4>Event page</h4>
+      <div class="not-enabled">No public page found for this event.</div></div>`;
+  }
+  const title = page.title ?? page.name ?? ev.event_name;
+  const bodyText =
+    page.content_text ?? page.plain_text ?? page.body_text ?? page.body_markdown ?? "";
+  const author = page.author ?? page.author_name;
+  const status = page.editorial_status ?? page.status;
+  const liveUrl = page.public_url ?? page.url ?? ev.event_url;
+  const m = cp.metrics;
+  const metricsRow =
+    m && (m.sends != null || m.opens != null || m.clicks != null)
+      ? `<div class="page-metrics">
+           <span><b>${fmt(m.sends)}</b> sends</span>
+           <span><b>${fmt(m.opens)}</b> opens</span>
+           <span><b>${fmt(m.clicks)}</b> clicks</span>
+         </div>`
+      : "";
+  const meta = [author ? `By ${esc(author)}` : "", status ? esc(status) : ""]
+    .filter(Boolean)
+    .join(" · ");
+  const link = liveUrl
+    ? `<a class="page-link" href="${esc(liveUrl)}" target="_blank" rel="noopener">Open live page ↗</a>`
+    : "";
+
+  return `<div class="panel" style="grid-column:1/-1">
+    <h4>Event page${link ? ` <span class="spacer-h"></span>${link}` : ""}</h4>
+    <div class="page-title">${esc(title)}</div>
+    ${meta ? `<div class="page-meta">${meta}</div>` : ""}
+    ${metricsRow}
+    <div class="page-body">${esc(bodyText.slice(0, 20000))}</div>
+  </div>`;
 }
 
 // Short "Jun 29" held-date label from the event's start date.

@@ -316,8 +316,8 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
         return Ok(());
     };
 
-    // Locate the event to derive weblog_token + date bounds.
-    let (weblog_token, event_date, paid) = {
+    // Locate the event to derive weblog_token + date bounds + content page token.
+    let (weblog_token, event_date, paid, content_page_token) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
         match db::get_event_detail(&conn, meetup_token)? {
@@ -334,7 +334,13 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
                     })
                     .unwrap_or_default();
                 let paid = ev.get("stripe_payment_link_active").and_then(Value::as_bool).unwrap_or(false);
-                (wl, date, paid)
+                let cpt = ev
+                    .get("content_page_token")
+                    .and_then(Value::as_str)
+                    .or_else(|| ev.get("refs").and_then(|r| r.get("content_page_token")).and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_string();
+                (wl, date, paid, cpt)
             }
             None => return Ok(()),
         }
@@ -410,6 +416,34 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
         let state = app.state::<AppState>();
         let conn = state.db.lock().unwrap();
         let _ = db::upsert_summary(&conn, meetup_token, total, checked_in, groups.as_ref(), &now);
+    }
+
+    // Public content page + email metrics (specs/event-page-view). Only when the
+    // event has a content page token; degrade independently on scope/group block.
+    if !content_page_token.is_empty() {
+        match api.content_page_get(&content_page_token).await {
+            Ok(ok) => {
+                // Email metrics are optional enrichment; a failure there must not
+                // blank the page body.
+                let metrics = match api.content_page_metrics_get(&content_page_token).await {
+                    Ok(m) => Some(m.data),
+                    Err(_) => None,
+                };
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::upsert_content_page(
+                    &conn, meetup_token, Some(&ok.data), metrics.as_ref(), false, None, &now,
+                )?;
+                record_rate_locked(&conn, "content_page", &ok.rate);
+            }
+            Err(e) if e.is_capability_block() => {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::upsert_content_page(&conn, meetup_token, None, None, true, Some(&e.to_string()), &now)?;
+            }
+            Err(AppError::RateLimited(msg)) => apply_backoff(app, "content_page", parse_retry_after(&msg)),
+            Err(_) => {}
+        }
     }
 
     let _ = app.emit("detail:updated", json!({ "meetup_token": meetup_token }));
