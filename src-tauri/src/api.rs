@@ -150,6 +150,25 @@ impl ApiClient {
         )
         .await
     }
+
+    /// The rendered public content page for an event (body markdown/text,
+    /// title, author/editorial metadata, live URL).
+    pub async fn content_page_get(&self, content_page_token: &str) -> AppResult<ApiOk> {
+        self.call(
+            "content_pages/get",
+            json!({ "content_page_token": content_page_token }),
+        )
+        .await
+    }
+
+    /// Email metrics (sends/opens/clicks) for a content page.
+    pub async fn content_page_metrics_get(&self, content_page_token: &str) -> AppResult<ApiOk> {
+        self.call(
+            "content_pages/metrics/get",
+            json!({ "content_page_token": content_page_token }),
+        )
+        .await
+    }
 }
 
 fn read_rate(resp: &reqwest::Response) -> RateInfo {
