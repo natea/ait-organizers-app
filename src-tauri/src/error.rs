@@ -44,6 +44,24 @@ impl AppError {
         }
     }
 
+    /// Stable snake_case code for this variant, mirroring the API envelope so
+    /// the frontend can branch degraded copy (e.g. group vs scope).
+    pub fn code(&self) -> &'static str {
+        match self {
+            AppError::NoKey => "no_key",
+            AppError::Unauthorized(_) => "unauthorized",
+            AppError::ForbiddenRole(_) => "forbidden_role",
+            AppError::ForbiddenScope(_) => "forbidden_scope",
+            AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+            AppError::RateLimited(_) => "rate_limited",
+            AppError::NotFound(_) => "not_found",
+            AppError::Network(_) => "network",
+            AppError::Keychain(_) => "keychain",
+            AppError::Db(_) => "db",
+            AppError::Other(_) => "other",
+        }
+    }
+
     /// True when the feature behind this endpoint is unavailable for this
     /// caller and further polling should stop (background-sync degradation).
     pub fn is_capability_block(&self) -> bool {

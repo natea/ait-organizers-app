@@ -64,6 +64,9 @@ pub fn run() {
                 let _ = sync::run_cycle(handle.clone(), false).await;
                 // Past events fetched once at launch; not part of the poll loop.
                 let _ = sync::run_past(handle.clone()).await;
+                // Chapter email deliverability: launch + manual refresh only,
+                // never the 2-minute loop (specs/email-lifecycle, design D3).
+                let _ = sync::fetch_chapter_email(&handle).await;
                 let mut ticker = tokio::time::interval(POLL_INTERVAL);
                 ticker.tick().await; // consume immediate first tick
                 loop {
@@ -82,6 +85,10 @@ pub fn run() {
             commands::get_events,
             commands::get_event_detail,
             commands::fetch_event_detail,
+            commands::get_event_email,
+            commands::get_send_job_throughput,
+            commands::get_chapter_deliverability,
+            commands::refresh_email,
             commands::refresh_now,
             commands::get_next_event,
             commands::set_notifications_enabled,

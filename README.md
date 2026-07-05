@@ -19,6 +19,14 @@ and change notifications. Built on the [AI Tinkerers Agents API](https://aitinke
 
 ![Event detail](docs/screenshots/detail.png)
 
+**Per-event email** — send-job delivery accounting, live active-send throughput, and open/click performance:
+
+![Event email panel](docs/screenshots/email-event-panel.png)
+
+**Chapter email deliverability** — sender-domain health, fatigue-risk tiers, and recent sends:
+
+![Email deliverability](docs/screenshots/email-deliverability.png)
+
 > Screenshots use representative sample data.
 
 ## Stack

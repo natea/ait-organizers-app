@@ -57,7 +57,10 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
         let conn = state.db.lock().unwrap();
         let _ = conn.execute_batch(
             "DELETE FROM events; DELETE FROM rsvp_summaries; DELETE FROM awaiting_payment;
-             DELETE FROM performance_snapshots; DELETE FROM sync_state;",
+             DELETE FROM performance_snapshots; DELETE FROM content_pages;
+             DELETE FROM email_send_jobs; DELETE FROM email_event_summary;
+             DELETE FROM email_throughput; DELETE FROM email_deliverability;
+             DELETE FROM sync_state;",
         );
     }
     // Reset first-sync suppression so re-sign-in doesn't fire stale notifications.
@@ -100,6 +103,41 @@ pub async fn refresh_now(app: AppHandle) -> AppResult<()> {
     let up = sync::run_cycle(app.clone(), true).await;
     let _ = sync::run_past(app).await;
     up
+}
+
+// ── Email lifecycle (specs/email-lifecycle) ────────────────────────────────
+
+/// Cached email surface for one event (summary, send jobs, campaign rates).
+#[tauri::command]
+pub fn get_event_email(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_event_email(&conn, &meetup_token)
+}
+
+/// Cached throughput series + progress for one send job.
+#[tauri::command]
+pub fn get_send_job_throughput(state: State<'_, AppState>, token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_throughput(&conn, &token)
+}
+
+/// Cached chapter deliverability view (health, fatigue tier summary, recent jobs).
+#[tauri::command]
+pub fn get_chapter_deliverability(state: State<'_, AppState>) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_chapter_deliverability(&conn)
+}
+
+/// Manual email fetch. With a `meetup_token` it refreshes that event's send-job
+/// summary + campaign + active-send throughput (the panel calls this on open and
+/// on the gentle active-send cadence). Without one it refreshes the chapter
+/// deliverability surface (launch / manual refresh only, never the poll loop).
+#[tauri::command]
+pub async fn refresh_email(app: AppHandle, meetup_token: Option<String>) -> AppResult<()> {
+    match meetup_token {
+        Some(token) => sync::fetch_event_email(&app, &token).await,
+        None => sync::fetch_chapter_email(&app).await,
+    }
 }
 
 #[tauri::command]
