@@ -28,6 +28,8 @@ export interface PerformanceRow {
   conversion?: { completed_rsvps_per_page_view?: number };
 }
 
+export type EventKind = "upcoming" | "past";
+
 export interface EventObj {
   meetup_token: string;
   weblog_token?: string;
@@ -46,6 +48,8 @@ export interface EventObj {
   event_url?: string;
   status?: string;
   stripe_payment_link_active?: boolean;
+  // Injected by the Rust cache: which tab this event belongs to.
+  kind?: EventKind;
   rsvps?: Rsvps;
   organizer?: Organizer;
   gallery_preview?: GalleryPhoto[];

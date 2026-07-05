@@ -92,6 +92,16 @@ impl ApiClient {
         self.call("meetups/upcoming", json!({ "limit": limit })).await
     }
 
+    /// The caller's past (completed) events. `meetups/search` with `status=past`
+    /// returns them without needing a query; results land in `data.matches`.
+    pub async fn past_events(&self, limit: u32) -> AppResult<ApiOk> {
+        self.call(
+            "meetups/search",
+            json!({ "status": "past", "limit": limit }),
+        )
+        .await
+    }
+
     /// Aggregate performance row(s) for one chapter/date range.
     pub async fn performance(
         &self,

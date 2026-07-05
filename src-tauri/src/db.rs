@@ -17,6 +17,7 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             attending      INTEGER,
             waitlisted     INTEGER,
             paid           INTEGER,
+            kind           TEXT NOT NULL DEFAULT 'upcoming',
             raw_json       TEXT NOT NULL,
             updated_at     TEXT NOT NULL
         );
@@ -54,9 +55,16 @@ pub fn init(conn: &Connection) -> AppResult<()> {
         );
         "#,
     )?;
+    // Migration for caches created before the `kind` column existed. ALTER
+    // errors with "duplicate column name" on already-migrated DBs — ignore it.
+    let _ = conn.execute(
+        "ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'upcoming'",
+        [],
+    );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_event(
     conn: &Connection,
     meetup_token: &str,
@@ -65,19 +73,21 @@ pub fn upsert_event(
     attending: i64,
     waitlisted: i64,
     paid: bool,
+    kind: &str,
     raw: &Value,
     now: &str,
 ) -> AppResult<()> {
     conn.execute(
         "INSERT INTO events
-           (meetup_token, weblog_token, starts_at_utc, attending, waitlisted, paid, raw_json, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           (meetup_token, weblog_token, starts_at_utc, attending, waitlisted, paid, kind, raw_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(meetup_token) DO UPDATE SET
            weblog_token=excluded.weblog_token,
            starts_at_utc=excluded.starts_at_utc,
            attending=excluded.attending,
            waitlisted=excluded.waitlisted,
            paid=excluded.paid,
+           kind=excluded.kind,
            raw_json=excluded.raw_json,
            updated_at=excluded.updated_at",
         params![
@@ -87,6 +97,7 @@ pub fn upsert_event(
             attending,
             waitlisted,
             paid as i64,
+            kind,
             raw.to_string(),
             now
         ],
@@ -106,19 +117,37 @@ pub fn prev_counts(conn: &Connection, meetup_token: &str) -> AppResult<Option<(i
     Ok(row)
 }
 
-/// Remove events no longer present upstream so the overview stays accurate.
-pub fn retain_events(conn: &Connection, keep_tokens: &[String]) -> AppResult<()> {
+/// Remove events of one `kind` no longer present upstream. Scoping by kind is
+/// required so an upcoming refresh never evicts cached past events, and vice
+/// versa (specs/past-events).
+pub fn retain_events(conn: &Connection, kind: &str, keep_tokens: &[String]) -> AppResult<()> {
     let existing: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT meetup_token FROM events")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn.prepare("SELECT meetup_token FROM events WHERE kind = ?1")?;
+        let rows = stmt.query_map(params![kind], |r| r.get::<_, String>(0))?;
         rows.filter_map(Result::ok).collect()
     };
     for token in existing {
         if !keep_tokens.iter().any(|k| k == &token) {
-            conn.execute("DELETE FROM events WHERE meetup_token = ?1", params![token])?;
+            conn.execute(
+                "DELETE FROM events WHERE meetup_token = ?1 AND kind = ?2",
+                params![token, kind],
+            )?;
         }
     }
     Ok(())
+}
+
+/// True when a token is already cached under a different kind — used to keep an
+/// upcoming row from being shadowed by a past fetch around start time.
+pub fn event_kind(conn: &Connection, meetup_token: &str) -> AppResult<Option<String>> {
+    let v = conn
+        .query_row(
+            "SELECT kind FROM events WHERE meetup_token = ?1",
+            params![meetup_token],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(v)
 }
 
 pub fn upsert_performance(
@@ -194,15 +223,26 @@ pub fn upsert_summary(
     Ok(())
 }
 
-/// All cached events, newest-soonest first, as their raw API JSON.
+/// All cached events with their `kind` injected. Upcoming sort soonest-first;
+/// past sort most-recent-first (the frontend filters by the active tab).
 pub fn get_events(conn: &Connection) -> AppResult<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "SELECT raw_json FROM events ORDER BY (starts_at_utc IS NULL), starts_at_utc ASC",
+        "SELECT raw_json, kind FROM events
+         ORDER BY
+           CASE kind WHEN 'upcoming' THEN 0 ELSE 1 END,
+           (starts_at_utc IS NULL),
+           CASE WHEN kind = 'past' THEN starts_at_utc END DESC,
+           starts_at_utc ASC",
     )?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
     let mut out = Vec::new();
-    for raw in rows.filter_map(Result::ok) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+    for (raw, kind) in rows.filter_map(Result::ok) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&raw) {
+            if let Value::Object(ref mut map) = v {
+                map.insert("kind".into(), Value::String(kind));
+            }
             out.push(v);
         }
     }
@@ -211,15 +251,18 @@ pub fn get_events(conn: &Connection) -> AppResult<Vec<Value>> {
 
 /// One event merged with its detail (performance + awaiting-payment + summary).
 pub fn get_event_detail(conn: &Connection, meetup_token: &str) -> AppResult<Option<Value>> {
-    let raw: Option<String> = conn
+    let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT raw_json FROM events WHERE meetup_token = ?1",
+            "SELECT raw_json, kind FROM events WHERE meetup_token = ?1",
             params![meetup_token],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(raw) = raw else { return Ok(None) };
+    let Some((raw, kind)) = row else { return Ok(None) };
     let mut event: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = event {
+        map.insert("kind".into(), Value::String(kind));
+    }
 
     let perf = conn
         .query_row(
@@ -329,4 +372,52 @@ pub fn feature_states(conn: &Connection) -> AppResult<Value> {
         );
     }
     Ok(Value::Object(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        init(&c).unwrap();
+        c
+    }
+
+    fn insert(c: &Connection, token: &str, kind: &str) {
+        upsert_event(c, token, "blog_x", "2026-01-01T00:00:00Z", 1, 0, false, kind, &json!({"meetup_token": token, "event_name": token}), "now").unwrap();
+    }
+
+    #[test]
+    fn upcoming_retention_preserves_past_events() {
+        let c = mem();
+        insert(&c, "up1", "upcoming");
+        insert(&c, "past1", "past");
+        insert(&c, "past2", "past");
+
+        // An upcoming refresh that keeps nothing must not touch past rows.
+        retain_events(&c, "upcoming", &[]).unwrap();
+
+        let kinds: Vec<String> = get_events(&c)
+            .unwrap()
+            .iter()
+            .map(|e| e.get("kind").and_then(Value::as_str).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "past").count(), 2, "past events must survive an upcoming retain");
+        assert_eq!(kinds.iter().filter(|k| *k == "upcoming").count(), 0, "upcoming events were retained-out");
+    }
+
+    #[test]
+    fn past_retention_preserves_upcoming_events() {
+        let c = mem();
+        insert(&c, "up1", "upcoming");
+        insert(&c, "past1", "past");
+        retain_events(&c, "past", &[]).unwrap();
+        let kinds: Vec<String> = get_events(&c)
+            .unwrap()
+            .iter()
+            .map(|e| e.get("kind").and_then(Value::as_str).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(kinds, vec!["upcoming".to_string()], "upcoming must survive a past retain");
+    }
 }

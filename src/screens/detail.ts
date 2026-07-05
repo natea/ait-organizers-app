@@ -47,11 +47,28 @@ export function mountDetail(opts: DetailOpts): DetailController {
 }
 
 function bodyHTML(ev: EventObj): string {
+  const isPast = (ev.kind ?? "upcoming") === "past";
   const r = ev.rsvps ?? {};
   const days = num(ev.days_until_event_in_event_timezone);
   const total = Math.max(num(r.registered), num(r.attending) + num(r.waitlisted) + num(r.cancelled), 1);
 
-  const rsvpPanel = `
+  // Check-in count comes from the performance aggregate (rsvps.completed) when
+  // in scope; otherwise fall back to final attending.
+  const completed = ev.performance?.perf?.rsvps?.completed;
+  const attended = typeof completed === "number" ? completed : num(r.attending);
+
+  const rsvpPanel = isPast
+    ? `
+    <div class="panel">
+      <h4>RSVP summary — final</h4>
+      <div class="rsvp-rows">
+        ${rsvpRow("Registered", num(r.registered), total, true)}
+        ${rsvpRow("Attending", num(r.attending), total, false)}
+        ${rsvpRow("Attended", attended, total, false)}
+        ${rsvpRow("Cancelled", num(r.cancelled), total, true)}
+      </div>
+    </div>`
+    : `
     <div class="panel">
       <h4>RSVP summary</h4>
       <div class="rsvp-rows">
@@ -62,14 +79,23 @@ function bodyHTML(ev: EventObj): string {
       </div>
     </div>`;
 
-  const payPanel = ev.stripe_payment_link_active ? awaitingPanel(ev) : "";
-  const perfPanel = performancePanel(ev);
+  // Past events aren't awaiting payment; show performance recap instead.
+  const payPanel = !isPast && ev.stripe_payment_link_active ? awaitingPanel(ev) : "";
+  const perfPanel = performancePanel(ev, isPast);
   const gallery = galleryPanel(ev.gallery_preview);
 
   const org = ev.organizer?.name ? ` · Organizer ${esc(ev.organizer.name)}` : "";
   const url = ev.event_url
     ? ` · <a href="${esc(ev.event_url)}" target="_blank" rel="noopener">${esc(displayUrl(ev.event_url))}</a>`
     : "";
+
+  const chip = isPast
+    ? `<div class="count held"><b>${esc(heldLabel(ev))}</b><small>held</small></div>`
+    : `<div class="count ${days < 0 ? "past" : ""}"><b>${days < 0 ? "—" : days === 0 ? "Today" : days + "d"}</b><small>${days > 0 ? "to go" : ""}</small></div>`;
+
+  const foot = isPast
+    ? "Recap — data frozen at last sync, event no longer polled"
+    : "Rendering from local cache";
 
   return `
     <button class="back" id="backBtn">← All events</button>
@@ -78,7 +104,7 @@ function bodyHTML(ev: EventObj): string {
         <h2>${esc(ev.event_name)}</h2>
         <div class="d-meta">${esc(ev.city ?? "")}${org}${url}</div>
       </div>
-      <div class="count ${days < 0 ? "past" : ""}"><b>${days < 0 ? "—" : days === 0 ? "Today" : days + "d"}</b><small>${days > 0 ? "to go" : ""}</small></div>
+      ${chip}
     </div>
     <div class="d-grid">
       ${rsvpPanel}
@@ -86,7 +112,17 @@ function bodyHTML(ev: EventObj): string {
       ${payPanel ? perfPanel : ""}
       ${gallery}
     </div>
-    <div class="lastsync-foot">Rendering from local cache</div>`;
+    <div class="lastsync-foot">${foot}</div>`;
+}
+
+// Short "Jun 29" held-date label from the event's start date.
+function heldLabel(ev: EventObj): string {
+  const iso = ev.starts_at_utc ?? ev.starts_at ?? "";
+  const t = Date.parse(iso);
+  if (Number.isFinite(t)) {
+    return new Date(t).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }
+  return ev.starts_at_local_date ?? "held";
 }
 
 function rsvpRow(label: string, val: number, total: number, alt: boolean): string {
@@ -123,17 +159,18 @@ function awaitingPanel(ev: EventObj): string {
 
 // Real performance endpoint returns an aggregate row (page views, completed
 // RSVPs, conversion) — rendered as stat tiles, not the prototype's line chart.
-function performancePanel(ev: EventObj): string {
+function performancePanel(ev: EventObj, isPast = false): string {
+  const title = isPast ? "Performance — final" : "Performance";
   const p = ev.performance;
   if (p?.unavailable) {
-    return `<div class="panel"><h4>Performance</h4>
+    return `<div class="panel"><h4>${title}</h4>
       <div class="not-enabled"><b>Not enabled for your chapter</b>
         The performance API group is switched off (or out of scope) for this weblog.
         Everything else still works.</div></div>`;
   }
   const row = p?.perf;
   if (!row) {
-    return `<div class="panel"><h4>Performance</h4>
+    return `<div class="panel"><h4>${title}</h4>
       <div class="not-enabled">No performance data cached yet.</div></div>`;
   }
   const views = num(row.traffic?.page_views);
@@ -141,10 +178,10 @@ function performancePanel(ev: EventObj): string {
   const conv = row.conversion?.completed_rsvps_per_page_view;
   const convPct = typeof conv === "number" ? `${(conv * 100).toFixed(1)}%` : "—";
   return `<div class="panel">
-    <h4>Performance</h4>
+    <h4>${title}</h4>
     <div class="rsvp-rows">
       ${statRow("Page views", fmt(views))}
-      ${statRow("Completed RSVPs", fmt(completed))}
+      ${statRow(isPast ? "Checked in" : "Completed RSVPs", fmt(completed))}
       ${statRow("Conversion", convPct)}
     </div></div>`;
 }
