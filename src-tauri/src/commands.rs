@@ -24,6 +24,8 @@ pub async fn validate_and_store(app: AppHandle, key: String) -> AppResult<Value>
         return Err(AppError::Unauthorized("Key did not validate".into()));
     }
     keychain::store_key(&key)?;
+    // Cache in memory so background sync doesn't re-read the keychain per call.
+    app.state::<AppState>().set_api_key(Some(key.clone()));
     // Kick off an initial sync (upcoming + past) in the background.
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -33,16 +35,18 @@ pub async fn validate_and_store(app: AppHandle, key: String) -> AppResult<Value>
     Ok(identity)
 }
 
-/// Whether onboarding has completed (a key is in the keychain).
+/// Whether onboarding has completed (a key is stored). Reads the cached key
+/// (keychain at most once per launch).
 #[tauri::command]
-pub fn has_key() -> AppResult<bool> {
-    Ok(keychain::get_key()?.is_some())
+pub fn has_key(state: State<'_, AppState>) -> AppResult<bool> {
+    Ok(state.api_key_cached()?.is_some())
 }
 
 /// Re-validate the stored key to render identity on launch.
 #[tauri::command]
-pub async fn get_identity() -> AppResult<Value> {
-    let Some(key) = keychain::get_key()? else {
+pub async fn get_identity(state: State<'_, AppState>) -> AppResult<Value> {
+    // Extract the owned key before any await (don't hold State across .await).
+    let Some(key) = state.api_key_cached()? else {
         return Err(AppError::NoKey);
     };
     ApiClient::new(key).validate().await
@@ -53,6 +57,7 @@ pub async fn get_identity() -> AppResult<Value> {
 pub fn sign_out(app: AppHandle) -> AppResult<()> {
     keychain::delete_key()?;
     let state = app.state::<AppState>();
+    state.set_api_key(None);
     {
         let conn = state.db.lock().unwrap();
         let _ = conn.execute_batch(

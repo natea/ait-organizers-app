@@ -21,3 +21,6 @@ src/generated/
 
 # dev mock harness (contains sample data)
 mock*.html
+
+# local build artifacts
+dist-build/

@@ -3,10 +3,19 @@ use std::sync::Mutex;
 
 use rusqlite::Connection;
 
+use crate::error::AppResult;
+use crate::keychain;
+
 /// Shared application state. The SQLite connection is the single source of
 /// truth for the UI (design D2); the frontend never calls the API directly.
 pub struct AppState {
     pub db: Mutex<Connection>,
+    /// In-memory copy of the API key. The keychain remains the durable store,
+    /// but it is read at most once per launch and cached here so background
+    /// sync (which builds a client on every API call) doesn't re-hit the
+    /// keychain — that repeated access is what triggers the macOS "allow"
+    /// prompt over and over on unsigned/dev builds.
+    api_key: Mutex<Option<String>>,
     /// True once the first successful sync has populated counts, so poll-diff
     /// notifications are suppressed for the initial fill (specs/tray-notifications).
     pub first_sync_done: AtomicBool,
@@ -20,10 +29,32 @@ impl AppState {
     pub fn new(db: Connection) -> Self {
         Self {
             db: Mutex::new(db),
+            api_key: Mutex::new(None),
             first_sync_done: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(true),
             syncing: AtomicBool::new(false),
         }
+    }
+
+    /// The API key, from the in-memory cache; on a miss, read the keychain
+    /// exactly once and cache it. Returns `None` before onboarding.
+    pub fn api_key_cached(&self) -> AppResult<Option<String>> {
+        {
+            let cache = self.api_key.lock().unwrap();
+            if cache.is_some() {
+                return Ok(cache.clone());
+            }
+        }
+        // Cache miss — one keychain read, then memoize (may be the only
+        // keychain access of the whole session).
+        let key = keychain::get_key()?;
+        *self.api_key.lock().unwrap() = key.clone();
+        Ok(key)
+    }
+
+    /// Update the cached key (after onboarding stores it) or clear it (sign-out).
+    pub fn set_api_key(&self, key: Option<String>) {
+        *self.api_key.lock().unwrap() = key;
     }
 }
 
