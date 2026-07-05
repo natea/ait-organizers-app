@@ -14,8 +14,7 @@ RSVPs".
 
 What is missing is the thing attendees actually see: the public content page
 (the rendered event/article body) and a single consolidated RSVP-flow summary
-sitting next to it. Network-wide this is the dominant surface (2.18M event/content
-page views, 155k RSVPs), yet organizers must leave the app and open the website to
+sitting next to it. Network-wide this is the dominant surface, yet organizers must leave the app and open the website to
 read their own page. This change adds a read-only event-page panel to the detail
 view: rendered public content page body plus a full RSVP funnel and page-traffic
 figures, with a deep link to the live URL.

@@ -5,8 +5,7 @@ screen today renders exclusively from the local SQLite cache that `sync.rs`
 populates by polling read-only Agents API endpoints; `api.rs` only ever issues
 `GET` requests, and the app advertises a "no write endpoints" posture. RSVP
 screening — reviewing registrants and promoting / waitlisting / declining them —
-is the single most-used organizer workflow (108k RSVP state-change events and
-2,151 screening-alert clicks network-wide), and the app cannot do it at all.
+is the single most-used organizer workflow network-wide, and the app cannot do it at all.
 
 This change adds the first attendee-management screen and, with it, the **first
 write-capable feature in the app's history**. Introducing mutations to an app

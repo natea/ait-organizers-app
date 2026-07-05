@@ -1,7 +1,6 @@
 # Proposal: add-networking-connect
 
-Stack-rank #6 — Networking / Connect (high email engagement, lower in-product
-posting: 108,943 networking-related emails; 64 board posts / 2,052 views network-wide).
+Stack-rank #6 — Networking / Connect (high email engagement, but much lighter in-product posting).
 
 ## Why
 

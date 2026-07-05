@@ -1,7 +1,6 @@
 # Proposal: add-email-lifecycle-monitor
 
-Stack-rank #2 — Event email lifecycle (operational backbone: 871k meetup mail
-logs; SES showing 606k opens / 227k clicks network-wide).
+Stack-rank #2 — Event email lifecycle (the operational backbone of every chapter).
 
 ## Why
 

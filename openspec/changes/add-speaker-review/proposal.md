@@ -1,7 +1,6 @@
 # Proposal: add-speaker-review
 
-Stack-rank #5 — Speaker proposal / speaker review (5,635 submitted talks, 3,301
-approved, 11,939 speaker-review alerts network-wide).
+Stack-rank #5 — Speaker proposal / speaker review (a high-volume programming workflow).
 
 ## Why
 

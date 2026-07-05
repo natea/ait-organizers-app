@@ -9,8 +9,7 @@ on a fixed cadence. The app already fetches `rsvps/summary` and a checked-in cou
 (`api.rs::rsvp_checked_in_count`) to *report* attendance on the Past tab, but it
 cannot *record* a check-in.
 
-Door check-in is the highest-frequency day-of workflow (47k attendance prompts,
-6,591 confirmations, 6,793 QR scans network-wide). This change adds the first
+Door check-in is the highest-frequency day-of workflow. This change adds the first
 attendance WRITE — `rsvps/mark_attended` — and the at-the-door screen that drives
 it. Verified against `openapi/openapi.yaml`:
 

@@ -1,7 +1,6 @@
 # Proposal: add-rsvp-screening
 
-Stack-rank #3 — RSVP screening / manage attendees (most important organizer tool:
-108k RSVP state-change events, 2,151 screening-alert clicks network-wide).
+Stack-rank #3 — RSVP screening / manage attendees (the most-used organizer tool network-wide).
 
 ## Why
 

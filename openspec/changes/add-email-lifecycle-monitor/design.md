@@ -9,8 +9,7 @@ Agents API, and `sync.rs` schedules polling with rate-header tracking and 429
 backoff. Errors are typed in `error.rs`, and API-group / scope / role denials
 already collapse to `is_capability_block()` so a feature can go dark cleanly.
 
-Event email is the operational backbone of a chapter (871k meetup mail-log rows
-network-wide; SES showing 606k opens / 227k clicks), yet organizers have no
+Event email is the operational backbone of a chapter, yet organizers have no
 in-app visibility into send health. When an announcement goes out they want to
 watch delivery, opens, clicks, and suppression, and catch a stuck or failing
 send before it hurts an event. This change adds an Email panel per event plus a
