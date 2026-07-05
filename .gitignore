@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+bun.lockb
+
+# build output
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# generated (regenerate with `bun run refresh-openapi`)
+src/generated/
+
+# os
+.DS_Store
+
+# log files
+*.log
+
+# local tooling state
+.claude/

@@ -1,0 +1,33 @@
+[package]
+name = "ait-mission-control"
+version = "0.1.0"
+description = "AI Tinkerers Event Mission Control"
+authors = ["AI Tinkerers"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "ait_mission_control_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+thiserror = "2"
+log = "0.4"
+
+[features]
+# Default production build. `custom-protocol` is required for release bundles.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

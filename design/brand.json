@@ -1,0 +1,232 @@
+{
+  "name": "AI Tinkerers",
+  "tagline": "The global community for hands‑on AI builders.",
+  "description": "AI Tinkerers creates curated rooms for 116,000+ people shipping real AI systems across 245 cities. Monthly AI meetups with live code demos, hackathons, and technical talks. No slides, no pitches.",
+  "sourceUrl": "https://aitinkerers.org/",
+  "logo": {
+    "primary": "logos/logo-stacked-760.png",
+    "alternates": [
+      "logos/wordmark-600.png",
+      "logos/header-img-2.png",
+      "logos/header-img-3.png",
+      "logos/header-img-4.png",
+      "logos/favicon-0.png",
+      "logos/og-image-1.jpg"
+    ],
+    "notes": "Primary lockup is the rounded indigo 'AI TINKERERS' wordmark on transparent PNG (760px, from the site nav/blog). wordmark-600 is the laptop-sticker variant of the same mark; favicon-0 is the square app icon; og-image is the social card."
+  },
+  "colors": [
+    {
+      "role": "background",
+      "hex": "#f8fafc",
+      "oklch": "oklch(98.4% 0.003 247.9)",
+      "name": "Slate 50",
+      "usage": "page canvas — measured on body { background-color: #f8fafc }; the site is light, not dark"
+    },
+    {
+      "role": "surface",
+      "hex": "#ffffff",
+      "oklch": "oklch(100% 0 0)",
+      "name": "White",
+      "usage": "cards and raised surfaces (bg-white ×65) with 1px slate borders and shadow-sm"
+    },
+    {
+      "role": "foreground",
+      "hex": "#0f172a",
+      "oklch": "oklch(20.8% 0.040 265.8)",
+      "name": "Slate ink",
+      "usage": "headlines (text-slate-900) and primary body ink; also the dark footer band (bg-slate-950)"
+    },
+    {
+      "role": "muted",
+      "hex": "#64748b",
+      "oklch": "oklch(55.4% 0.041 257.4)",
+      "name": "Slate 500",
+      "usage": "secondary text, metadata, placeholders (with #475569 for stronger supporting copy)"
+    },
+    {
+      "role": "border",
+      "hex": "#e2e8f0",
+      "oklch": "oklch(92.9% 0.013 255.5)",
+      "name": "Slate 200",
+      "usage": "1px hairlines, card borders, dividers"
+    },
+    {
+      "role": "accent",
+      "hex": "#31439b",
+      "oklch": "oklch(42.2% 0.145 270.3)",
+      "name": "Tinkerers indigo",
+      "usage": "primary CTAs and brand buttons (.tw-button-brand); hover darkens to #253274"
+    },
+    {
+      "role": "accent-secondary",
+      "hex": "#3d53c2",
+      "oklch": "oklch(49.1% 0.175 270.2)",
+      "name": "Indigo bright",
+      "usage": "accent borders, highlighted chips and link-level emphasis (border-[#3d53c2], bg tints at /10–/20 opacity)"
+    }
+  ],
+  "typography": {
+    "display": {
+      "family": "Source Sans Pro",
+      "fallbacks": [
+        "Open Sans",
+        "system-ui",
+        "-apple-system",
+        "Segoe UI",
+        "Helvetica Neue",
+        "Arial",
+        "sans-serif"
+      ],
+      "weights": [
+        600,
+        700,
+        900
+      ],
+      "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700;900&display=swap",
+      "notes": "Hero h1 is text-5xl/6xl font-extrabold tracking-tight; section heads run semibold/bold. Google Fonts now ships this family as 'Source Sans 3'."
+    },
+    "body": {
+      "family": "Source Sans Pro",
+      "fallbacks": [
+        "Open Sans",
+        "system-ui",
+        "-apple-system",
+        "Segoe UI",
+        "Helvetica Neue",
+        "Arial",
+        "sans-serif"
+      ],
+      "weights": [
+        400,
+        600,
+        700
+      ],
+      "googleFontsUrl": "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700;900&display=swap",
+      "notes": "font-semibold (×235) is the workhorse emphasis weight."
+    },
+    "mono": {
+      "family": "ui-monospace",
+      "fallbacks": [
+        "SFMono-Regular",
+        "Menlo",
+        "Monaco",
+        "Consolas",
+        "Liberation Mono",
+        "Courier New",
+        "monospace"
+      ],
+      "weights": [
+        400,
+        600
+      ],
+      "notes": "System mono stack used for terminal-styled UI (.ait-cc-terminal) and code/telemetry readouts."
+    }
+  },
+  "voice": {
+    "adjectives": [
+      "curated",
+      "technical",
+      "candid",
+      "hands-on",
+      "no-fluff"
+    ],
+    "tone": "Direct, practitioner-to-practitioner, quietly confident. Short declarative sentences. Evidence over hype: 'Demos, traces, systems, and scars carry more weight than predictions.' Never salesy, never breathless about AI.",
+    "messagingPillars": [
+      "The global community for hands‑on AI builders.",
+      "No slides, no pitches — working systems set the agenda.",
+      "Bring working code, share what broke, and leave with patterns you can ship.",
+      "Always curated: each city protects the room locally while contributing to a shared global standard.",
+      "Like the Homebrew Computer Club — small rooms where practitioners compare notes before the path is obvious."
+    ],
+    "vocabulary": {
+      "use": [
+        "builders",
+        "demos",
+        "working code",
+        "shipping",
+        "traces",
+        "failure modes",
+        "curated rooms",
+        "practitioners",
+        "patterns you can ship"
+      ],
+      "avoid": [
+        "thought leadership",
+        "AI panels",
+        "sales pitches",
+        "revolutionary/game-changing hype",
+        "predictions without demos"
+      ]
+    }
+  },
+  "imagery": {
+    "style": "Real documentary photography from actual meetups — crowded rooms, laptops open, someone demoing at a screen. Warm indoor light, candid framing, no stock photography.",
+    "subjects": [
+      "builders presenting live demos",
+      "audiences in small venues",
+      "laptops and projected code",
+      "city-by-city event photos"
+    ],
+    "treatment": "Photos sit in rounded-2xl cards with soft slate shadows (0 12px 28px rgba(15,23,42,.12)) and hover scale-105. Playful collage accents: Pangolin handwritten 'sticky-tape' labels on a yellow gradient.",
+    "avoid": [
+      "stock business imagery",
+      "abstract AI brain/robot art",
+      "posed corporate group shots"
+    ],
+    "samples": [
+      {
+        "file": "imagery/cover-0.jpg",
+        "kind": "cover",
+        "caption": "Social og:image card"
+      },
+      {
+        "file": "imagery/event-san-francisco.jpg",
+        "kind": "photo",
+        "caption": "San Francisco meetup"
+      },
+      {
+        "file": "imagery/event-paris.jpg",
+        "kind": "photo",
+        "caption": "Paris meetup"
+      },
+      {
+        "file": "imagery/event-sao-paulo.jpg",
+        "kind": "hero",
+        "caption": "São Paulo meetup — homepage hero rotation"
+      },
+      {
+        "file": "imagery/event-nurnberg.jpg",
+        "kind": "hero",
+        "caption": "Nürnberg meetup — homepage hero rotation"
+      },
+      {
+        "file": "imagery/event-seattle.jpg",
+        "kind": "photo",
+        "caption": "Seattle meetup"
+      },
+      {
+        "file": "imagery/event-boston.jpg",
+        "kind": "photo",
+        "caption": "Boston meetup"
+      },
+      {
+        "file": "imagery/event-valencia.jpg",
+        "kind": "hero",
+        "caption": "Valencia meetup — homepage hero rotation"
+      }
+    ]
+  },
+  "layout": {
+    "radius": "16px cards (rounded-2xl ×138), full pills for chips/buttons (rounded-full ×337)",
+    "borderWeight": "1px",
+    "spacing": "8px baseline grid, generous section padding on a centered max-width container",
+    "postureRules": [
+      "Light slate canvas (#f8fafc) with white cards — dark is reserved for the footer band and terminal motifs",
+      "Cards: bg-white + 1px #e2e8f0 border + shadow-sm; hero photos get the deeper 0 12px 28px rgba(15,23,42,.12) shadow",
+      "Chips, tags and secondary buttons are full pills; primary CTAs are solid #31439b with white text",
+      "Accent is used sparingly: indigo buttons and #3d53c2 borders/tints, never large washes",
+      "One playful flourish: Pangolin handwritten sticky-tape labels over photo collages"
+    ]
+  }
+}

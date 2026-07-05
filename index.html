@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Tinkerers — Mission Control</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!-- Root screens are rendered/toggled by src/main.ts -->
+    <div class="window-root">
+      <div class="titlebar" data-tauri-drag-region>
+        <div class="lights"><span></span><span></span><span></span></div>
+        <div class="t-name">AI Tinkerers — Mission Control</div>
+      </div>
+
+      <section class="screen active" id="scr-onboarding"></section>
+      <section class="screen" id="scr-overview"></section>
+      <section class="screen" id="scr-detail"></section>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
