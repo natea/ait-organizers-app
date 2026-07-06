@@ -119,6 +119,7 @@ export interface FeatureState {
   unavailable: boolean;
   note: string | null;
   last_fetch_at: string | null;
+  backoff_until?: string | null;
 }
 
 export interface EventsPayload {

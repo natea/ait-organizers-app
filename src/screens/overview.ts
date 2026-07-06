@@ -87,11 +87,21 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
     byId("tabUpcoming").classList.toggle("on", !past);
     byId("tabPast").classList.toggle("on", past);
 
+    // Rate-limit awareness: any endpoint still inside its backoff window means
+    // the API's (daily) budget is exhausted, so Refresh can't pull new data.
+    const nowMs = Date.now();
+    const rateLimited = Object.values(features).some(
+      (f) => f.backoff_until != null && Date.parse(f.backoff_until) > nowMs,
+    );
+
     // Sync indicator tracks the live (upcoming) feed regardless of active tab.
     const upcomingFetch = features["upcoming"]?.last_fetch_at ?? null;
     const syncLabel = byId("syncLabel");
     const syncDot = byId("syncDot");
-    if (upcomingFetch) {
+    if (rateLimited) {
+      syncLabel.textContent = "Rate-limited by the API";
+      syncDot.classList.add("stale");
+    } else if (upcomingFetch) {
       syncLabel.textContent = `Synced ${relTime(upcomingFetch)}`;
       syncDot.classList.remove("stale");
     } else {
@@ -99,9 +109,13 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
       syncDot.classList.add("stale");
     }
 
-    // Notice line differs per tab.
+    // Notice line: a rate-limit takes priority over per-tab notices.
     const notice = byId("truncNotice");
-    if (past) {
+    if (rateLimited) {
+      notice.textContent =
+        "Rate-limited by the AI Tinkerers API (daily request budget). New data resumes once it resets — or sign in with a fresh key in Settings.";
+      notice.style.display = "";
+    } else if (past) {
       notice.textContent =
         feat?.note === "truncated"
           ? `Recent past events — top ${tabEvents.length} shown, recap data frozen at last sync`
