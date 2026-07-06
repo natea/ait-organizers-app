@@ -89,7 +89,7 @@ export interface ContentPage {
   body_text?: string;
   content_text?: string;
   plain_text?: string;
-  author?: string;
+  author?: string | Record<string, unknown>;
   author_name?: string;
   editorial_status?: string;
   status?: string;

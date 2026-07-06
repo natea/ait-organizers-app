@@ -426,16 +426,22 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
     if !content_page_token.is_empty() {
         match api.content_page_get(&content_page_token).await {
             Ok(ok) => {
-                // Email metrics are optional enrichment; a failure there must not
-                // blank the page body.
+                // The API nests the article under data.content_page — unwrap it so
+                // the cached page fields (title, body_text, url, ...) sit at the top
+                // level the frontend reads. Same for metrics (data.metrics).
+                let page = ok
+                    .data
+                    .get("content_page")
+                    .cloned()
+                    .unwrap_or_else(|| ok.data.clone());
                 let metrics = match api.content_page_metrics_get(&content_page_token).await {
-                    Ok(m) => Some(m.data),
+                    Ok(m) => Some(m.data.get("metrics").cloned().unwrap_or(m.data)),
                     Err(_) => None,
                 };
                 let state = app.state::<AppState>();
                 let conn = state.db.lock().unwrap();
                 db::upsert_content_page(
-                    &conn, meetup_token, Some(&ok.data), metrics.as_ref(), false, None, &now,
+                    &conn, meetup_token, Some(&page), metrics.as_ref(), false, None, &now,
                 )?;
                 record_rate_locked(&conn, "content_page", &ok.rate);
             }

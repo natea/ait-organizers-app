@@ -6,13 +6,14 @@ import { renderOnboarding } from "./screens/onboarding";
 import { mountOverview, type OverviewController } from "./screens/overview";
 import { mountDetail, type DetailController } from "./screens/detail";
 import { mountEmail, type EmailController } from "./screens/email";
-import { byId } from "./util";
+import { mountSettings, type SettingsController } from "./screens/settings";
 
-type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail" | "scr-email";
+type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail" | "scr-email" | "scr-settings";
 
 let overview: OverviewController | null = null;
 let detail: DetailController | null = null;
 let email: EmailController | null = null;
+let settings: SettingsController | null = null;
 let currentDetailToken: string | null = null;
 
 function show(id: ScreenId): void {
@@ -32,6 +33,10 @@ function enterApp(): void {
       show("scr-email");
       email?.open();
     },
+    onOpenSettings: () => {
+      show("scr-settings");
+      settings?.open();
+    },
   });
   detail = mountDetail({
     onBack: () => {
@@ -45,6 +50,14 @@ function enterApp(): void {
       show("scr-overview");
       overview?.reload();
     },
+  });
+  settings = mountSettings({
+    onBack: () => {
+      show("scr-overview");
+      overview?.reload();
+    },
+    onChangeKey: goOnboarding,
+    onSignedOut: goOnboarding,
   });
   show("scr-overview");
 }
@@ -70,16 +83,18 @@ async function boot(): Promise<void> {
   if (onboarded) {
     enterApp();
   } else {
-    renderOnboarding(() => {
-      // Mount app screens after successful onboarding.
-      if (!overview) enterApp();
-      else show("scr-overview");
-    });
-    show("scr-onboarding");
+    goOnboarding();
   }
+}
 
-  // Titlebar label is set in index.html; nothing else needed here.
-  void byId;
+// Show onboarding to (re)enter a key; on success, resume the app.
+function goOnboarding(): void {
+  renderOnboarding(() => {
+    // Mount app screens after successful onboarding.
+    if (!overview) enterApp();
+    else show("scr-overview");
+  });
+  show("scr-onboarding");
 }
 
 boot();
