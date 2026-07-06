@@ -112,8 +112,9 @@ function bodyHTML(d: ChapterDeliverability | null, loaded: boolean): string {
     return `<div class="panel"><h4>Email deliverability</h4>
       <div class="empty"><b>No deliverability data</b>
         <span>Nothing to show yet. This happens when your chapter has no recent
-        sends, the subscribers group is off for your key, or the app hasn't
-        resolved your chapter (open an event first, then hit Refresh).</span></div></div>`;
+        sends, the subscribers group is off for your key, the API's daily request
+        budget is used up, or the app hasn't resolved your chapter (open an event
+        first, then hit Refresh).</span></div></div>`;
   }
   if (d.unavailable) {
     return `<div class="panel"><h4>Email deliverability</h4>${emailBlockedHTML(d.reason)}</div>`;

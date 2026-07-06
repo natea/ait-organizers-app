@@ -905,21 +905,27 @@ pub fn primary_weblog(conn: &Connection) -> AppResult<Option<String>> {
 
 /// Feature availability map for the UI (background-sync degradation).
 pub fn feature_states(conn: &Connection) -> AppResult<Value> {
-    let mut stmt =
-        conn.prepare("SELECT key, unavailable, note, last_fetch_at FROM sync_state")?;
+    let mut stmt = conn
+        .prepare("SELECT key, unavailable, note, last_fetch_at, backoff_until FROM sync_state")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)? != 0,
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut map = serde_json::Map::new();
-    for (key, unavailable, note, last) in rows.filter_map(Result::ok) {
+    for (key, unavailable, note, last, backoff_until) in rows.filter_map(Result::ok) {
         map.insert(
             key,
-            json!({ "unavailable": unavailable, "note": note, "last_fetch_at": last }),
+            json!({
+                "unavailable": unavailable,
+                "note": note,
+                "last_fetch_at": last,
+                "backoff_until": backoff_until,
+            }),
         );
     }
     Ok(Value::Object(map))

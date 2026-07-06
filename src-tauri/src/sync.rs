@@ -13,7 +13,12 @@ use crate::db;
 const UPCOMING_KEY: &str = "upcoming";
 const PAST_KEY: &str = "past";
 const PAST_LIMIT: u32 = 50;
-const MAX_BACKOFF_SECS: i64 = 60;
+// Honor the API's Retry-After up to 6 hours. The daily-budget rate limit returns
+// a Retry-After of many hours; capping at 60s made the poll loop keep hammering
+// the maxed-out API every ~2 min, which pinned the budget and never let it
+// recover. Per-minute limits return small Retry-Afters, so those still back off
+// only briefly.
+const MAX_BACKOFF_SECS: i64 = 6 * 3600;
 
 fn iso_now() -> String {
     Utc::now().to_rfc3339()
@@ -49,7 +54,7 @@ fn apply_backoff(app: &AppHandle, key: &str, retry_after: Option<i64>) {
         None,
         Some(&until),
         false,
-        Some("backing off after rate limit"),
+        Some("rate_limited"), // stable marker the UI can surface
     );
 }
 
