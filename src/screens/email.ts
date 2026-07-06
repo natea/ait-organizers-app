@@ -27,6 +27,7 @@ export interface EmailController {
 export function mountEmail(opts: EmailOpts): EmailController {
   const root = byId("scr-email");
   let data: ChapterDeliverability | null = null;
+  let loaded = false;
 
   onEmailChapter(() => {
     void refresh();
@@ -48,7 +49,7 @@ export function mountEmail(opts: EmailOpts): EmailController {
             <div class="d-meta">Chapter-wide sender health, fatigue risk, and recent sends</div>
           </div>
         </div>
-        ${bodyHTML(data)}
+        ${bodyHTML(data, loaded)}
         <div class="lastsync-foot">${footNote(data)}</div>
       </div>`;
     byId<HTMLButtonElement>("emailBackBtn").addEventListener("click", opts.onBack);
@@ -72,6 +73,7 @@ export function mountEmail(opts: EmailOpts): EmailController {
     } catch {
       data = null;
     }
+    loaded = true;
     paint();
   }
 
@@ -98,10 +100,20 @@ function footNote(d: ChapterDeliverability | null): string {
   return `Rendering from local cache · chapter data refreshes on launch and manual refresh${when}`;
 }
 
-function bodyHTML(d: ChapterDeliverability | null): string {
-  if (!d || (!d.health && !d.fatigue && (!d.recent_jobs || !d.recent_jobs.length) && !d.unavailable)) {
+function bodyHTML(d: ChapterDeliverability | null, loaded: boolean): string {
+  const isEmpty =
+    !d || (!d.health && !d.fatigue && (!d.recent_jobs || !d.recent_jobs.length) && !d.unavailable);
+  if (isEmpty) {
+    if (!loaded) {
+      return `<div class="panel"><h4>Email deliverability</h4>
+        <div class="empty"><div class="spinner"></div><span>Loading deliverability data…</span></div></div>`;
+    }
+    // Loaded but nothing came back — don't spin forever (that was the bug).
     return `<div class="panel"><h4>Email deliverability</h4>
-      <div class="empty"><div class="spinner"></div><span>Loading deliverability data…</span></div></div>`;
+      <div class="empty"><b>No deliverability data</b>
+        <span>Nothing to show yet. This happens when your chapter has no recent
+        sends, the subscribers group is off for your key, or the app hasn't
+        resolved your chapter (open an event first, then hit Refresh).</span></div></div>`;
   }
   if (d.unavailable) {
     return `<div class="panel"><h4>Email deliverability</h4>${emailBlockedHTML(d.reason)}</div>`;

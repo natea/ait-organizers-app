@@ -7,6 +7,7 @@ import { byId, esc, fmt, num } from "../util";
 interface OverviewOpts {
   onOpenDetail: (meetupToken: string) => void;
   onOpenEmail: () => void;
+  onOpenSettings: () => void;
 }
 
 export interface OverviewController {
@@ -22,6 +23,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
       <span class="spacer"></span>
       <span class="sync"><span class="s-dot" id="syncDot"></span><span id="syncLabel">—</span></span>
       <button class="refresh" id="emailNavBtn">Email health</button>
+      <button class="refresh" id="settingsNavBtn">Settings</button>
       <button class="refresh" id="refreshBtn">Refresh</button>
     </div>
     <div class="content">
@@ -47,6 +49,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
   byId("tabUpcoming").addEventListener("click", () => setTab("upcoming"));
   byId("tabPast").addEventListener("click", () => setTab("past"));
   byId("emailNavBtn").addEventListener("click", () => opts.onOpenEmail());
+  byId("settingsNavBtn").addEventListener("click", () => opts.onOpenSettings());
 
   refreshBtn.addEventListener("click", async () => {
     refreshBtn.disabled = true;

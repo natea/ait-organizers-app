@@ -346,7 +346,14 @@ function eventPagePanel(ev: EventObj): string {
   const title = page.title ?? page.name ?? ev.event_name;
   const bodyText =
     page.content_text ?? page.plain_text ?? page.body_text ?? page.body_markdown ?? "";
-  const author = page.author ?? page.author_name;
+  // `author` may be a string or an object ({blogger_token, ...}); only show a
+  // human-readable name, never "[object Object]".
+  const author =
+    typeof page.author === "string"
+      ? page.author
+      : typeof page.author_name === "string"
+        ? page.author_name
+        : undefined;
   const status = page.editorial_status ?? page.status;
   const liveUrl = page.public_url ?? page.url ?? ev.event_url;
   const m = cp.metrics;
