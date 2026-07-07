@@ -326,6 +326,30 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             updated_at    TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_write_audit_meetup ON write_audit(meetup_token);
+
+        -- Attendance check-in (specs/attendance-checkin). A door tap ALWAYS
+        -- writes here first (design D3) — the actual `mark_attended` POST is
+        -- made later by sync::flush_action_queue, never synchronously from the
+        -- tap itself, so a check-in is never lost to a network blip. `status`
+        -- is 'pending' (unsent), 'sent' (flushed successfully or the server
+        -- reported the RSVP already attended), or 'failed' (hard denied,
+        -- design D7 — never retried). `client_token` is a stable per-action
+        -- token so retries/double-taps are safe (design D4); `audit_id` links
+        -- back to the `write_audit` row this action's outcome updates.
+        CREATE TABLE IF NOT EXISTS action_queue (
+            id            TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            rsvp_ref      TEXT NOT NULL,
+            meetup_token  TEXT NOT NULL,
+            client_token  TEXT NOT NULL,
+            audit_id      TEXT,
+            created_at    TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_action_queue_status ON action_queue(status);
+        CREATE INDEX IF NOT EXISTS idx_action_queue_meetup ON action_queue(meetup_token, kind);
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -337,6 +361,9 @@ pub fn init(conn: &Connection) -> AppResult<()> {
     // Real check-in count (rsvps/summary status=checked_in). ALTER errors on
     // already-migrated DBs — ignore.
     let _ = conn.execute("ALTER TABLE rsvp_summaries ADD COLUMN checked_in INTEGER", []);
+    // Door check-in timestamp (specs/attendance-checkin) — ALTER errors on
+    // already-migrated DBs — ignore.
+    let _ = conn.execute("ALTER TABLE rsvp_rows ADD COLUMN checked_in_at TEXT", []);
     Ok(())
 }
 
@@ -1868,14 +1895,15 @@ pub fn upsert_rsvp_row(
     let registrant_status_label = pick_str(&rsvp, &["registrant_status_label"]).map(str::to_string);
     let registrant_status_text = pick_str(&rsvp, &["registrant_status_text"]).map(str::to_string);
     let checked_in = rsvp.get("checked_in").and_then(Value::as_bool).unwrap_or(false);
+    let checked_in_at = pick_str(&rsvp, &["checked_in_at"]).map(str::to_string);
     let score = pick_num(&rsvp, &["score", "engagement_score", "user_score"])
         .or_else(|| pick_num(&client, &["score", "engagement_score"]));
 
     conn.execute(
         "INSERT INTO rsvp_rows
            (rsvp_ref, meetup_token, name, email, state, registrant_status,
-            registrant_status_label, registrant_status_text, checked_in, score, raw_json, updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            registrant_status_label, registrant_status_text, checked_in, checked_in_at, score, raw_json, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(rsvp_ref) DO UPDATE SET
            meetup_token=excluded.meetup_token,
            name=excluded.name,
@@ -1885,12 +1913,13 @@ pub fn upsert_rsvp_row(
            registrant_status_label=excluded.registrant_status_label,
            registrant_status_text=excluded.registrant_status_text,
            checked_in=excluded.checked_in,
+           checked_in_at=COALESCE(excluded.checked_in_at, rsvp_rows.checked_in_at),
            score=excluded.score,
            raw_json=excluded.raw_json,
            updated_at=excluded.updated_at",
         params![
             rsvp_ref, meetup_token, name, email, state, registrant_status,
-            registrant_status_label, registrant_status_text, checked_in as i64,
+            registrant_status_label, registrant_status_text, checked_in as i64, checked_in_at,
             score, row.to_string(), now
         ],
     )?;
@@ -1910,11 +1939,12 @@ fn rsvp_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "checked_in": r.get::<_, i64>(8)? != 0,
         "score": r.get::<_, Option<f64>>(9)?,
         "updated_at": r.get::<_, String>(10)?,
+        "checked_in_at": r.get::<_, Option<String>>(11)?,
     }))
 }
 
 const RSVP_ROW_COLS: &str = "rsvp_ref, meetup_token, name, email, state, registrant_status,
-    registrant_status_label, registrant_status_text, checked_in, score, updated_at";
+    registrant_status_label, registrant_status_text, checked_in, score, updated_at, checked_in_at";
 
 /// One cached RSVP row (used to look up `from_state` before a mutation, and
 /// as the post-commit re-read result).
@@ -2019,6 +2049,180 @@ pub fn get_rsvp_detail(conn: &Connection, rsvp_ref: &str) -> AppResult<Option<Va
         )
         .optional()?;
     Ok(row)
+}
+
+// ── Attendance check-in (specs/attendance-checkin) ──────────────────────────
+// The door check-in list reuses `rsvp_rows`/`rsvp_search` (task 2.1 alternative
+// "or reuse an rsvp cache") rather than a parallel cache — one less table to
+// keep in sync, and the screening screen's cached attendees are already
+// exactly the fields this screen needs. Only the offline action queue below is
+// new: a door tap ALWAYS lands here first (design D3) and is flushed to
+// `rsvps/mark_attended` later by `sync::flush_action_queue` — never a
+// synchronous POST from the tap itself.
+
+/// Outcome of attempting to enqueue a door check-in (design D4) — lets the
+/// caller respond without ever inserting a second pending row for the same RSVP.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Enqueued,
+    AlreadyCheckedIn,
+    AlreadyQueued,
+}
+
+/// True when an unsent (`pending`) check-in action already exists for this RSVP.
+pub fn has_unsent_checkin(conn: &Connection, rsvp_ref: &str) -> AppResult<bool> {
+    let v = conn
+        .query_row(
+            "SELECT 1 FROM action_queue WHERE rsvp_ref = ?1 AND kind = 'mark_attended' AND status = 'pending' LIMIT 1",
+            params![rsvp_ref],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(v.is_some())
+}
+
+/// Enqueue one door check-in, deduping BEFORE insert (design D4): an RSVP
+/// already cached as `checked_in`, or one with an unsent queue row, is not
+/// enqueued again. On a genuine enqueue, the cached row is flipped to
+/// checked-in immediately (design D3's "optimistic, whether or not the
+/// network is up") — `sync::flush_action_queue` is what actually talks to the
+/// API, later.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue_checkin_action(
+    conn: &Connection,
+    id: &str,
+    rsvp_ref: &str,
+    meetup_token: &str,
+    client_token: &str,
+    audit_id: &str,
+    now: &str,
+) -> AppResult<EnqueueOutcome> {
+    let already_checked = conn
+        .query_row(
+            "SELECT checked_in FROM rsvp_rows WHERE rsvp_ref = ?1",
+            params![rsvp_ref],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        != 0;
+    if already_checked {
+        return Ok(EnqueueOutcome::AlreadyCheckedIn);
+    }
+    if has_unsent_checkin(conn, rsvp_ref)? {
+        return Ok(EnqueueOutcome::AlreadyQueued);
+    }
+    conn.execute(
+        "INSERT INTO action_queue
+           (id, kind, rsvp_ref, meetup_token, client_token, audit_id, created_at, status, attempts, last_error)
+         VALUES (?1, 'mark_attended', ?2, ?3, ?4, ?5, ?6, 'pending', 0, NULL)",
+        params![id, rsvp_ref, meetup_token, client_token, audit_id, now],
+    )?;
+    conn.execute(
+        "UPDATE rsvp_rows SET checked_in = 1, checked_in_at = ?2 WHERE rsvp_ref = ?1",
+        params![rsvp_ref, now],
+    )?;
+    Ok(EnqueueOutcome::Enqueued)
+}
+
+fn action_queue_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": r.get::<_, String>(0)?,
+        "rsvp_ref": r.get::<_, String>(1)?,
+        "meetup_token": r.get::<_, String>(2)?,
+        "client_token": r.get::<_, String>(3)?,
+        "audit_id": r.get::<_, Option<String>>(4)?,
+        "created_at": r.get::<_, String>(5)?,
+        "attempts": r.get::<_, i64>(6)?,
+    }))
+}
+
+/// All still-pending (unsent) actions of one kind, oldest first — what
+/// `sync::flush_action_queue` drains each cycle. Durable in SQLite, so this
+/// survives an app restart untouched (design D3 "Lost queue on crash").
+pub fn pending_actions(conn: &Connection, kind: &str) -> AppResult<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, rsvp_ref, meetup_token, client_token, audit_id, created_at, attempts
+         FROM action_queue WHERE kind = ?1 AND status = 'pending' ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![kind], action_queue_row)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Resolve a flushed action as sent — a real success OR the server reporting
+/// the RSVP was already attended both land here (design D4: idempotent retry).
+pub fn mark_action_sent(conn: &Connection, id: &str) -> AppResult<()> {
+    conn.execute("UPDATE action_queue SET status = 'sent' WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Hard-deny an action (`forbidden_*`, design D7) — terminal, never retried.
+/// The optimistic check-in is reverted by the caller via `revert_checkin`.
+pub fn mark_action_failed(conn: &Connection, id: &str, error_code: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE action_queue SET status = 'failed', last_error = ?2 WHERE id = ?1",
+        params![id, error_code],
+    )?;
+    Ok(())
+}
+
+/// Record a non-terminal flush attempt (network/timeout/other) — stays
+/// `pending` and is retried on the next cycle; only the attempt count and last
+/// error are updated for visibility.
+pub fn bump_action_attempt(conn: &Connection, id: &str, error: Option<&str>) -> AppResult<()> {
+    conn.execute(
+        "UPDATE action_queue SET attempts = attempts + 1, last_error = ?2 WHERE id = ?1",
+        params![id, error],
+    )?;
+    Ok(())
+}
+
+/// Revert an optimistic check-in that was denied server-side (design D7) so
+/// the row reflects the real (not-checked-in) state.
+pub fn revert_checkin(conn: &Connection, rsvp_ref: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE rsvp_rows SET checked_in = 0, checked_in_at = NULL WHERE rsvp_ref = ?1",
+        params![rsvp_ref],
+    )?;
+    Ok(())
+}
+
+/// rsvp_refs with a still-pending queue row for one event — lets the screen
+/// badge a row "checked in (pending sync)" vs settled (design D3/D5).
+pub fn pending_checkin_refs(conn: &Connection, meetup_token: &str) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT rsvp_ref FROM action_queue WHERE meetup_token = ?1 AND kind = 'mark_attended' AND status = 'pending'",
+    )?;
+    let rows = stmt.query_map(params![meetup_token], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Terminally-denied check-ins for one event (`status = 'failed'`, design D7)
+/// — the screen uses this to degrade its controls to disabled with an
+/// explanatory notice rather than silently letting taps keep failing.
+pub fn checkin_denials(conn: &Connection, meetup_token: &str) -> AppResult<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT rsvp_ref, last_error FROM action_queue
+         WHERE meetup_token = ?1 AND kind = 'mark_attended' AND status = 'failed'",
+    )?;
+    let rows = stmt.query_map(params![meetup_token], |r| {
+        Ok(json!({
+            "rsvp_ref": r.get::<_, String>(0)?,
+            "error_code": r.get::<_, Option<String>>(1)?,
+        }))
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Count of not-yet-synced check-ins for one event — added to the server
+/// `checked_in` total for the live progress figure (design D5).
+pub fn unsynced_checkin_count(conn: &Connection, meetup_token: &str) -> AppResult<i64> {
+    let n = conn.query_row(
+        "SELECT COUNT(*) FROM action_queue WHERE meetup_token = ?1 AND kind = 'mark_attended' AND status = 'pending'",
+        params![meetup_token],
+        |r| r.get::<_, i64>(0),
+    )?;
+    Ok(n)
 }
 
 // ── Write audit trail (design D3) ───────────────────────────────────────────
@@ -2686,5 +2890,176 @@ mod tests {
         assert_eq!(arr.len(), 2, "must not include the other event's audit rows");
         assert_eq!(arr[0].get("id").and_then(Value::as_str), Some("e2"), "newest first");
         assert_eq!(arr[1].get("id").and_then(Value::as_str), Some("e1"));
+    }
+
+    // ── Attendance check-in (specs/attendance-checkin) ─────────────────────
+
+    fn seed_rsvp(c: &Connection, rsvp_ref: &str, meetup_token: &str, name: &str) {
+        let row = json!({
+            "rsvp": { "rsvp_token": rsvp_ref, "state": "attending", "checked_in": false },
+            "client": { "name": name },
+        });
+        upsert_rsvp_row(c, meetup_token, &row, "t0").unwrap();
+    }
+
+    #[test]
+    fn checkin_enqueue_flips_the_cached_row_optimistically() {
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        let outcome = enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        assert_eq!(outcome, EnqueueOutcome::Enqueued);
+
+        let row = get_rsvp_row(&c, "r1").unwrap().unwrap();
+        assert_eq!(row.get("checked_in").and_then(Value::as_bool), Some(true), "tap must reflect optimistically before any flush");
+        assert_eq!(row.get("checked_in_at").and_then(Value::as_str), Some("t1"));
+
+        let pending = pending_actions(&c, "mark_attended").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].get("rsvp_ref").and_then(Value::as_str), Some("r1"));
+        assert_eq!(pending[0].get("client_token").and_then(Value::as_str), Some("ct1"));
+    }
+
+    #[test]
+    fn checkin_flush_marks_sent_and_removes_from_pending() {
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        assert_eq!(pending_actions(&c, "mark_attended").unwrap().len(), 1);
+
+        mark_action_sent(&c, "q1").unwrap();
+
+        assert!(pending_actions(&c, "mark_attended").unwrap().is_empty(), "a sent action must no longer be pending");
+        assert!(pending_checkin_refs(&c, "m1").unwrap().is_empty());
+        assert_eq!(unsynced_checkin_count(&c, "m1").unwrap(), 0);
+        // The row itself stays checked-in — flushing settles the queue, it
+        // doesn't touch the already-optimistic cache state.
+        let row = get_rsvp_row(&c, "r1").unwrap().unwrap();
+        assert_eq!(row.get("checked_in").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn checkin_double_tap_does_not_double_enqueue() {
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        let first = enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        // The first tap already flipped the cached row to checked-in
+        // optimistically, so the second tap is caught by that check before it
+        // would even reach the unsent-queue-row check — either dedupe branch
+        // is a correct "don't enqueue" outcome (design D4).
+        let second = enqueue_checkin_action(&c, "q2", "r1", "m1", "ct2", "aud2", "t2").unwrap();
+        assert_eq!(first, EnqueueOutcome::Enqueued);
+        assert_eq!(second, EnqueueOutcome::AlreadyCheckedIn, "a second tap while the first is still unsent must not enqueue again");
+        assert_eq!(pending_actions(&c, "mark_attended").unwrap().len(), 1, "only one queue row for the same RSVP");
+    }
+
+    #[test]
+    fn checkin_double_tap_before_optimistic_flip_is_caught_by_queue_dedupe() {
+        // Exercises the other dedupe branch directly: a queue row already
+        // pending for an RSVP that (for whatever reason) isn't yet flagged
+        // checked_in must still block a second enqueue.
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        conn_insert_bare_queue_row(&c, "q1", "r1", "m1");
+        let outcome = enqueue_checkin_action(&c, "q2", "r1", "m1", "ct2", "aud2", "t2").unwrap();
+        assert_eq!(outcome, EnqueueOutcome::AlreadyQueued);
+        assert_eq!(pending_actions(&c, "mark_attended").unwrap().len(), 1);
+    }
+
+    fn conn_insert_bare_queue_row(c: &Connection, id: &str, rsvp_ref: &str, meetup_token: &str) {
+        c.execute(
+            "INSERT INTO action_queue (id, kind, rsvp_ref, meetup_token, client_token, audit_id, created_at, status, attempts, last_error)
+             VALUES (?1, 'mark_attended', ?2, ?3, 'ct0', 'aud0', 't0', 'pending', 0, NULL)",
+            params![id, rsvp_ref, meetup_token],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkin_already_checked_in_is_not_re_enqueued() {
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        mark_action_sent(&c, "q1").unwrap(); // settle — the row is now durably checked_in
+
+        let outcome = enqueue_checkin_action(&c, "q2", "r1", "m1", "ct2", "aud2", "t2").unwrap();
+        assert_eq!(outcome, EnqueueOutcome::AlreadyCheckedIn, "an attendee already checked in must not be re-queued");
+        assert!(pending_actions(&c, "mark_attended").unwrap().is_empty());
+    }
+
+    #[test]
+    fn checkin_retry_of_already_attended_resolves_as_sent_no_duplicate() {
+        // Mirrors the flush path: the server reports the RSVP was already
+        // attended on retry, and that must resolve exactly like a fresh
+        // success — never a second write_audit / queue row.
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        // Simulate the flush's "already attended" branch treating it as success.
+        mark_action_sent(&c, "q1").unwrap();
+        assert!(pending_actions(&c, "mark_attended").unwrap().is_empty());
+        assert_eq!(unsynced_checkin_count(&c, "m1").unwrap(), 0);
+    }
+
+    #[test]
+    fn checkin_forbidden_reverts_the_optimistic_row_and_stops_retrying() {
+        let c = mem();
+        seed_rsvp(&c, "r1", "m1", "Ada");
+        enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+
+        mark_action_failed(&c, "q1", "forbidden_scope").unwrap();
+        revert_checkin(&c, "r1").unwrap();
+
+        assert!(pending_actions(&c, "mark_attended").unwrap().is_empty(), "a failed action must never be retried");
+        let row = get_rsvp_row(&c, "r1").unwrap().unwrap();
+        assert_eq!(row.get("checked_in").and_then(Value::as_bool), Some(false), "the optimistic check-in must be reverted on hard deny");
+        assert_eq!(row.get("checked_in_at").cloned(), Some(Value::Null));
+
+        // A now-un-checked-in attendee CAN be tapped again (e.g. after the
+        // organizer's scope is fixed) — the dedupe must not wedge it shut forever.
+        let outcome = enqueue_checkin_action(&c, "q2", "r1", "m1", "ct2", "aud2", "t2").unwrap();
+        assert_eq!(outcome, EnqueueOutcome::Enqueued);
+    }
+
+    #[test]
+    fn checkin_queue_survives_a_fresh_connection_reopen() {
+        // Simulates an app restart: re-`init` a *new* connection over the same
+        // on-disk file and confirm the pending row is still there and flushable.
+        let dir = std::env::temp_dir().join(format!("ait-mc-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.sqlite3");
+
+        {
+            let c = Connection::open(&path).unwrap();
+            init(&c).unwrap();
+            seed_rsvp(&c, "r1", "m1", "Ada");
+            enqueue_checkin_action(&c, "q1", "r1", "m1", "ct1", "aud1", "t1").unwrap();
+        } // connection dropped — simulates process exit
+
+        let c2 = Connection::open(&path).unwrap();
+        init(&c2).unwrap();
+        let pending = pending_actions(&c2, "mark_attended").unwrap();
+        assert_eq!(pending.len(), 1, "the queued check-in must survive a restart");
+        assert_eq!(pending[0].get("rsvp_ref").and_then(Value::as_str), Some("r1"));
+        let row = get_rsvp_row(&c2, "r1").unwrap().unwrap();
+        assert_eq!(row.get("checked_in").and_then(Value::as_bool), Some(true), "the optimistic cache state must also survive a restart");
+
+        mark_action_sent(&c2, "q1").unwrap();
+        assert!(pending_actions(&c2, "mark_attended").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkin_write_audit_is_reused_for_committed_check_ins() {
+        // The attendance-checkin write path reuses the same write_audit table
+        // as rsvp-screening (design D2) rather than a bespoke log.
+        let c = mem();
+        insert_write_audit(&c, "aud1", "checkin_mark_attended", Some("m1"), &["r1".to_string()], Some("registered"), Some("attending"), false, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        let row = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(row.get("action").and_then(Value::as_str), Some("checkin_mark_attended"));
+        assert_eq!(row.get("outcome").and_then(Value::as_str), Some("ok"));
+        let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
     }
 }

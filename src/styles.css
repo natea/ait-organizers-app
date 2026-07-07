@@ -1587,3 +1587,25 @@ body.popover-body {
   gap: 10px;
   margin-top: 18px;
 }
+
+/* ── Attendance check-in (specs/attendance-checkin) ───────────────────────── */
+/* Reuses .panel, .not-enabled, .btn, .btn-ghost, .chip, .job-chip, .gauge/
+   .g-bar/.g-fill/.g-label, .b-count, .pending-chip, .scr-toolbar/.scr-filters,
+   .scr-list, .rsvp-row-item/.rsvp-row-main/.rsvp-who/.rsvp-actions from above —
+   only the 3-column row grid (no checkbox/score columns) and progress spacing
+   are new. */
+
+.checkin-row-head,
+.checkin-row-main {
+  grid-template-columns: 2fr 1.2fr auto;
+}
+
+.checkin-progress h4 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.checkin-tap {
+  min-width: 104px;
+}

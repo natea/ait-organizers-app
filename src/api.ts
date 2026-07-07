@@ -4,6 +4,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ChapterDeliverability,
+  CheckinAttendeesResult,
+  CheckinCommitResult,
+  CheckinConfirm,
+  CheckinCount,
+  CheckinDenial,
+  CheckinQueueUpdatedEvent,
   ConfirmSummary,
   EventEmail,
   EventObj,
@@ -373,4 +379,51 @@ export function onRsvpWriteSettled(cb: (e: RsvpWriteSettledEvent) => void): Prom
 /** Emitted after the attendee list finishes a background fetch. */
 export function onRsvpListUpdated(cb: (meetupToken: string) => void): Promise<UnlistenFn> {
   return listen<{ meetup_token: string }>("rsvp_list:updated", (e) => cb(e.payload.meetup_token));
+}
+
+// ── Attendance check-in (specs/attendance-checkin) ──────────────────────────
+// The door screen for the live/next event. A tap still goes through the same
+// prepare/commit write guardrail as RSVP screening — just without a blocking
+// dialog in between (design D2): the tap itself is the confirmation. The
+// commit only enqueues to a durable offline queue; the actual network write
+// happens on the next sync flush, so a tap never blocks on connectivity.
+
+/** Cached attendee list for the live/next event (fast path; no network).
+ *  Pass an explicit `meetupToken` to target a specific event. */
+export function getCheckinAttendees(meetupToken?: string): Promise<CheckinAttendeesResult> {
+  return invoke("get_checkin_attendees", { meetupToken: meetupToken ?? null });
+}
+
+/** Fetch + cache the attendee list, opportunistically flushing the offline
+ *  check-in queue, then return the merged view. */
+export function fetchCheckinAttendees(meetupToken?: string): Promise<CheckinAttendeesResult> {
+  return invoke("fetch_checkin_attendees", { meetupToken: meetupToken ?? null });
+}
+
+/** Live checked-in-vs-attending progress for the resolved event. */
+export function getCheckinCount(meetupToken?: string): Promise<CheckinCount> {
+  return invoke("get_checkin_count", { meetupToken: meetupToken ?? null });
+}
+
+/** Step 1: bind a confirmation token to an exact door check-in. */
+export function checkinPrepare(rsvpRef: string, meetupToken: string): Promise<CheckinConfirm> {
+  return invoke("checkin_prepare", { rsvpRef, meetupToken });
+}
+
+/** Step 2: commit the confirmed check-in. Arguments must exactly match what
+ *  was passed to `checkinPrepare`, or the token is rejected. Returns
+ *  immediately with the optimistic row — the network write is deferred. */
+export function checkinCommit(token: string, rsvpRef: string, meetupToken: string): Promise<CheckinCommitResult> {
+  return invoke("checkin_commit", { token, rsvpRef, meetupToken });
+}
+
+/** Emitted after a sync cycle flushes the offline check-in queue for an event. */
+export function onCheckinQueueUpdated(cb: (e: CheckinQueueUpdatedEvent) => void): Promise<UnlistenFn> {
+  return listen<CheckinQueueUpdatedEvent>("checkin:queue_updated", (e) => cb(e.payload));
+}
+
+/** Terminally-denied check-ins for the resolved event (design D7) — used to
+ *  disable the check-in controls with an explanatory notice. */
+export function getCheckinDenials(meetupToken?: string): Promise<CheckinDenial[]> {
+  return invoke("get_checkin_denials", { meetupToken: meetupToken ?? null });
 }
