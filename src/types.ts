@@ -773,3 +773,101 @@ export interface NetworkingWriteSettledEvent {
   board_key?: string | null;
 }
 
+// ── Media video kit (specs/media-video-kit) ─────────────────────────────────
+// The app's fifth write feature. Browsing (folder tree, files, notes,
+// transcripts) renders only from the SQLite cache; uploads, folder create,
+// note edits, and starting transcription/scale-down go through the same
+// prepare/commit confirmation gate as every other write feature. The Media
+// API group is authorized ONLY for index owners / `index_video_editor` — city
+// owners (this app's primary audience) will see `availability.unavailable`
+// true for essentially every event; the view degrades to a prominent panel
+// and hides every write control, per design decision 6.
+
+export interface MediaFolder {
+  folder_token: string;
+  parent_token?: string | null;
+  name?: string | null;
+  weblog_token?: string | null;
+  meetup_token?: string | null;
+  note?: string | null;
+  updated_at: string;
+}
+
+export interface MediaFile {
+  file_token: string;
+  folder_token: string;
+  filename?: string | null;
+  content_type?: string | null;
+  size_in_bytes?: number | null;
+  uploader_name?: string | null;
+  created_at?: string | null;
+  note?: string | null;
+  has_transcript: boolean;
+  updated_at: string;
+}
+
+export interface MediaAvailability {
+  meetup_token: string;
+  folder_token?: string | null;
+  unavailable: boolean;
+  reason?: string | null;
+  updated_at: string;
+}
+
+export interface MediaView {
+  meetup_token: string;
+  availability: MediaAvailability;
+  folder: MediaFolder | null;
+  subfolders: MediaFolder[];
+  files: MediaFile[];
+}
+
+export interface MediaFolderView {
+  folder: MediaFolder | null;
+  subfolders: MediaFolder[];
+  files: MediaFile[];
+}
+
+export interface MediaTranscript {
+  file_token: string;
+  transcript_text?: string | null;
+  transcript_json?: unknown;
+  transcribed_at?: string | null;
+}
+
+export type MediaJobType = "transcript" | "scale_down";
+export type MediaJobStatus = "processing" | "success" | "failed";
+
+export interface MediaJob {
+  file_token: string;
+  job_type: MediaJobType;
+  status: MediaJobStatus;
+  attempts?: number | null;
+  error_detail?: string | null;
+  result?: Record<string, unknown> | null;
+  updated_at: string;
+}
+
+export interface MediaDownload {
+  file_token?: string;
+  filename?: string;
+  download_url?: string;
+  expires_in_seconds?: number;
+  [k: string]: unknown;
+}
+
+/** Returned by every media `*_prepare` command — echoed back unchanged (plus
+ *  the identical mutation arguments) to the matching `*_commit`, or the write
+ *  guardrail rejects it as tampered. */
+export interface MediaWritePreview {
+  token: string;
+  action:
+    | "media_file_upload"
+    | "media_folder_create"
+    | "media_note_update"
+    | "media_transcript_generate"
+    | "media_scale_down";
+  count: number;
+  [k: string]: unknown;
+}
+

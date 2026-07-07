@@ -20,6 +20,15 @@ import type {
   FlaggedReason,
   Identity,
   LogoSearchResult,
+  MediaDownload,
+  MediaFile,
+  MediaFolder,
+  MediaFolderView,
+  MediaJob,
+  MediaJobType,
+  MediaTranscript,
+  MediaView,
+  MediaWritePreview,
   NetworkingWriteSettledEvent,
   NextEvent,
   PromotionDraft,
@@ -707,4 +716,144 @@ export function onNetworkingThreadUpdated(cb: (boardKey: string, rootPostToken: 
 /** Emitted after the targeted post-write re-sync settles the cache. */
 export function onNetworkingWriteSettled(cb: (e: NetworkingWriteSettledEvent) => void): Promise<UnlistenFn> {
   return listen<NetworkingWriteSettledEvent>("networking_write:settled", (e) => cb(e.payload));
+}
+
+// ── Media video kit (specs/media-video-kit) ─────────────────────────────────
+// Browsing renders only from the SQLite cache; every mutation (upload, folder
+// create, note update, transcription/scale-down kickoff) is a two-step
+// prepare/commit pair, same gate as every other write feature. City owners
+// are not authorized for the Media API group — `availability.unavailable`
+// tells the screen to render the role-gated panel instead of the browser.
+
+/** Cached Media view for one event (fast path; no network). */
+export function getMediaView(meetupToken: string): Promise<MediaView> {
+  return invoke("get_media_view", { meetupToken });
+}
+
+/** Resolve/refresh the event's media folder + contents, then return the
+ *  cached view. Records role-gated unavailability rather than throwing when
+ *  the caller isn't authorized. */
+export function fetchMediaView(meetupToken: string): Promise<MediaView> {
+  return invoke("fetch_media_view", { meetupToken });
+}
+
+/** Cached contents of an arbitrary already-resolved folder (browsing into a
+ *  subfolder; fast path, no network). */
+export function getMediaFolder(folderToken: string): Promise<MediaFolderView> {
+  return invoke("get_media_folder", { folderToken });
+}
+
+/** Fetch + cache one folder's contents, then return them. */
+export function fetchMediaFolder(folderToken: string): Promise<MediaFolderView> {
+  return invoke("fetch_media_folder", { folderToken });
+}
+
+/** Request a presigned download URL for one file (read, not a write). */
+export function mediaFileDownload(fileToken: string): Promise<MediaDownload> {
+  return invoke("media_file_download", { fileToken });
+}
+
+/** Step 1: bind a confirmation token to an upload, after a client-side size
+ *  pre-check (also enforced server-side against the file on disk before the
+ *  token is prepared). */
+export function mediaUploadPrepare(
+  folderToken: string,
+  filePath: string,
+  filename: string,
+  note?: string,
+): Promise<MediaWritePreview> {
+  return invoke("media_upload_prepare", { folderToken, filePath, filename, note: note ?? null });
+}
+
+/** Step 2: commit the confirmed upload. Arguments must exactly match what was
+ *  passed to `mediaUploadPrepare`, or the token is rejected. */
+export function mediaUploadCommit(
+  token: string,
+  folderToken: string,
+  filePath: string,
+  filename: string,
+  contentType?: string,
+  note?: string,
+): Promise<MediaFile> {
+  return invoke("media_upload_commit", {
+    token,
+    folderToken,
+    filePath,
+    filename,
+    contentType: contentType ?? null,
+    note: note ?? null,
+  });
+}
+
+/** Step 1: bind a confirmation token to creating a folder. Exactly one of
+ *  `parentToken` (subfolder) / `weblogToken` (root-level) is required. */
+export function mediaFolderCreatePrepare(
+  name: string,
+  parentToken?: string,
+  weblogToken?: string,
+): Promise<MediaWritePreview> {
+  return invoke("media_folder_create_prepare", { name, parentToken: parentToken ?? null, weblogToken: weblogToken ?? null });
+}
+
+/** Step 2: commit the confirmed folder creation. */
+export function mediaFolderCreateCommit(
+  token: string,
+  name: string,
+  parentToken?: string,
+  weblogToken?: string,
+): Promise<MediaFolder> {
+  return invoke("media_folder_create_commit", { token, name, parentToken: parentToken ?? null, weblogToken: weblogToken ?? null });
+}
+
+/** Step 1: bind a confirmation token to a note update. Exactly one of
+ *  `fileToken`/`folderToken` is required; an empty note clears it. */
+export function mediaNoteUpdatePrepare(note: string, target: { fileToken?: string; folderToken?: string }): Promise<MediaWritePreview> {
+  return invoke("media_note_update_prepare", { fileToken: target.fileToken ?? null, folderToken: target.folderToken ?? null, note });
+}
+
+/** Step 2: commit the confirmed note update. */
+export function mediaNoteUpdateCommit(
+  token: string,
+  note: string,
+  target: { fileToken?: string; folderToken?: string },
+): Promise<Record<string, unknown>> {
+  return invoke("media_note_update_commit", { token, fileToken: target.fileToken ?? null, folderToken: target.folderToken ?? null, note });
+}
+
+/** Step 1: bind a confirmation token to starting transcription. */
+export function mediaTranscriptGeneratePrepare(fileToken: string): Promise<MediaWritePreview> {
+  return invoke("media_transcript_generate_prepare", { fileToken });
+}
+
+/** Step 2: commit the confirmed transcription kickoff; returns the initial
+ *  `processing` job row — poll `fetchMediaJobStatus` for progress. */
+export function mediaTranscriptGenerateCommit(token: string, fileToken: string): Promise<MediaJob> {
+  return invoke("media_transcript_generate_commit", { token, fileToken });
+}
+
+/** Step 1: bind a confirmation token to starting a video scale-down. */
+export function mediaScaleDownPrepare(fileToken: string): Promise<MediaWritePreview> {
+  return invoke("media_scale_down_prepare", { fileToken });
+}
+
+/** Step 2: commit the confirmed scale-down kickoff. */
+export function mediaScaleDownCommit(token: string, fileToken: string): Promise<MediaJob> {
+  return invoke("media_scale_down_commit", { token, fileToken });
+}
+
+/** Cached transcript body for one file, if a transcription has completed. */
+export function getMediaTranscript(fileToken: string): Promise<MediaTranscript | null> {
+  return invoke("get_media_transcript", { fileToken });
+}
+
+/** Cached job status (fast path; no network). */
+export function getMediaJobStatus(fileToken: string, jobType: MediaJobType): Promise<MediaJob | null> {
+  return invoke("get_media_job_status", { fileToken, jobType });
+}
+
+/** Poll one job's status (network + cache) to a terminal state. Propagates a
+ *  `rate_limited` error on 429 so the panel can back off and show a
+ *  transient notice while keeping the last-known status visible. */
+export function fetchMediaJobStatus(fileToken: string, jobType: MediaJobType): Promise<MediaJob | null> {
+  return invoke("fetch_media_job_status", { fileToken, jobType });
 }

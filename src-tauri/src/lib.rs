@@ -32,6 +32,7 @@ const NETWORKING_POLL_INTERVAL: Duration = Duration::from_secs(180);
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Open the SQLite cache in the app data dir.
             let dir = app.path().app_data_dir().expect("app data dir");
@@ -171,6 +172,24 @@ pub fn run() {
             commands::attachment_upload_commit,
             commands::direct_message_prepare,
             commands::direct_message_commit,
+            commands::get_media_view,
+            commands::fetch_media_view,
+            commands::get_media_folder,
+            commands::fetch_media_folder,
+            commands::media_file_download,
+            commands::media_upload_prepare,
+            commands::media_upload_commit,
+            commands::media_folder_create_prepare,
+            commands::media_folder_create_commit,
+            commands::media_note_update_prepare,
+            commands::media_note_update_commit,
+            commands::media_transcript_generate_prepare,
+            commands::media_transcript_generate_commit,
+            commands::media_scale_down_prepare,
+            commands::media_scale_down_commit,
+            commands::get_media_transcript,
+            commands::get_media_job_status,
+            commands::fetch_media_job_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

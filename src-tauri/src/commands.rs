@@ -82,7 +82,10 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
              DELETE FROM sponsors; DELETE FROM sponsor_search_cache;
              DELETE FROM sponsor_contacts; DELETE FROM sponsor_contacts_meta;
              DELETE FROM sponsor_drafts; DELETE FROM sponsor_jobs;
-             DELETE FROM rsvp_rows; DELETE FROM rsvp_detail;",
+             DELETE FROM rsvp_rows; DELETE FROM rsvp_detail;
+             DELETE FROM media_folders; DELETE FROM media_files;
+             DELETE FROM media_transcripts; DELETE FROM media_jobs;
+             DELETE FROM media_availability;",
         );
     }
     // Reset first-sync suppression so re-sign-in doesn't fire stale notifications.
@@ -1491,4 +1494,406 @@ pub async fn direct_message_commit(
         db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
     }
     result
+}
+
+// ── Media video kit (specs/media-video-kit) — reuses write_guard ───────────
+// The app's fifth write feature. The Media API group is authorized ONLY for
+// index owners / `index_video_editor` — city owners (this app's primary
+// audience) see `media_availability.unavailable=true` for essentially every
+// event, and the frontend renders a prominent "not available for your role"
+// panel instead of the browser/write controls (design decision 6). Every
+// mutation still passes through the same prepare/commit gate and reuses
+// `write_audit` — no bespoke audit path.
+
+fn media_upload_payload(folder_token: &str, file_path: &str, filename: &str, note: Option<&str>) -> Value {
+    json!({
+        "action": "media_file_upload",
+        "folder_token": folder_token,
+        "file_path": file_path,
+        "filename": filename,
+        "note": note,
+    })
+}
+
+fn media_folder_create_payload(name: &str, parent_token: Option<&str>, weblog_token: Option<&str>) -> Value {
+    json!({
+        "action": "media_folder_create",
+        "name": name,
+        "parent_token": parent_token,
+        "weblog_token": weblog_token,
+    })
+}
+
+fn media_note_update_payload(file_token: Option<&str>, folder_token: Option<&str>, note: &str) -> Value {
+    json!({
+        "action": "media_note_update",
+        "file_token": file_token,
+        "folder_token": folder_token,
+        "note": note,
+    })
+}
+
+fn media_transcript_generate_payload(file_token: &str) -> Value {
+    json!({ "action": "media_transcript_generate", "file_token": file_token })
+}
+
+fn media_scale_down_payload(file_token: &str) -> Value {
+    json!({ "action": "media_scale_down", "file_token": file_token })
+}
+
+/// Cached Media view for one event (fast path; no network).
+#[tauri::command]
+pub fn get_media_view(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_media_view(&conn, &meetup_token)
+}
+
+/// Resolve/refresh the event's media folder + contents, recording role-gated
+/// unavailability instead of erroring, then return the cached view. An
+/// explicit screen-open/manual-refresh action — never the poll loop.
+#[tauri::command]
+pub async fn fetch_media_view(app: AppHandle, meetup_token: String) -> AppResult<Value> {
+    sync::fetch_event_media(&app, &meetup_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_media_view(&conn, &meetup_token)
+}
+
+/// Cached contents of an arbitrary already-resolved folder (browsing into a
+/// subfolder; fast path, no network).
+#[tauri::command]
+pub fn get_media_folder(state: State<'_, AppState>, folder_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_media_folder_view(&conn, &folder_token)
+}
+
+/// Fetch + cache one folder's contents, then return them.
+#[tauri::command]
+pub async fn fetch_media_folder(app: AppHandle, folder_token: String) -> AppResult<Value> {
+    sync::fetch_media_folder(&app, &folder_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_media_folder_view(&conn, &folder_token)
+}
+
+/// Request a presigned download URL for one file. A read, not a write — no
+/// write_guard needed. The app never streams/caches the file body (spec).
+#[tauri::command]
+pub async fn media_file_download(app: AppHandle, file_token: String) -> AppResult<Value> {
+    sync::media_file_download(&app, &file_token).await
+}
+
+/// Step 1 of the write guardrail for an upload: makes NO network call.
+/// Enforces the 50 MB size cap BEFORE a token is ever prepared, reading the
+/// file's size from disk (spec: "MUST reject files larger than 50 MB before
+/// base64-encoding").
+#[tauri::command]
+pub fn media_upload_prepare(
+    state: State<'_, AppState>,
+    folder_token: String,
+    file_path: String,
+    filename: String,
+    note: Option<String>,
+) -> AppResult<Value> {
+    let meta = std::fs::metadata(&file_path)
+        .map_err(|e| AppError::Other(format!("could not read file: {e}")))?;
+    if meta.len() > crate::sync::MEDIA_UPLOAD_MAX_BYTES {
+        return Err(AppError::Other(format!(
+            "file is {} bytes, exceeding the 50 MB limit — choose a smaller file",
+            meta.len()
+        )));
+    }
+    let payload = media_upload_payload(&folder_token, &file_path, &filename, note.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "media_file_upload",
+        "folder_token": folder_token,
+        "filename": filename,
+        "size_in_bytes": meta.len(),
+        "note": note,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token, write the `attempted` audit row, upload (Rust
+/// re-checks the size cap defensively, base64-encodes, POSTs), update the
+/// audit outcome, and on success the folder is re-synced so the new file
+/// appears from the cache.
+#[tauri::command]
+pub async fn media_upload_commit(
+    app: AppHandle,
+    token: String,
+    folder_token: String,
+    file_path: String,
+    filename: String,
+    content_type: Option<String>,
+    note: Option<String>,
+) -> AppResult<Value> {
+    let payload = media_upload_payload(&folder_token, &file_path, &filename, note.as_deref());
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "media_file_upload", None, &[filename.clone()],
+            None, Some("uploaded"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::media_file_upload(&app, &folder_token, &filename, content_type.as_deref(), &file_path, note.as_deref()).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for creating a folder. Requires exactly one
+/// of `parent_token` (subfolder) / `weblog_token` (root-level).
+#[tauri::command]
+pub fn media_folder_create_prepare(
+    state: State<'_, AppState>,
+    name: String,
+    parent_token: Option<String>,
+    weblog_token: Option<String>,
+) -> AppResult<Value> {
+    if name.trim().is_empty() {
+        return Err(AppError::Other("folder name is required".into()));
+    }
+    if parent_token.is_none() && weblog_token.is_none() {
+        return Err(AppError::Other("either parent_token or weblog_token is required".into()));
+    }
+    let payload = media_folder_create_payload(&name, parent_token.as_deref(), weblog_token.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "media_folder_create",
+        "name": name,
+        "parent_token": parent_token,
+        "weblog_token": weblog_token,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token, audit before/after, create, and (on success)
+/// re-sync the parent folder so the new subfolder appears from cache.
+#[tauri::command]
+pub async fn media_folder_create_commit(
+    app: AppHandle,
+    token: String,
+    name: String,
+    parent_token: Option<String>,
+    weblog_token: Option<String>,
+) -> AppResult<Value> {
+    let payload = media_folder_create_payload(&name, parent_token.as_deref(), weblog_token.as_deref());
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "media_folder_create", None, &[name.clone()],
+            None, Some("created"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::media_folder_create(&app, &name, parent_token.as_deref(), weblog_token.as_deref()).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for a note update. Requires exactly one of
+/// `file_token`/`folder_token`.
+#[tauri::command]
+pub fn media_note_update_prepare(
+    state: State<'_, AppState>,
+    file_token: Option<String>,
+    folder_token: Option<String>,
+    note: String,
+) -> AppResult<Value> {
+    if file_token.is_none() == folder_token.is_none() {
+        return Err(AppError::Other("exactly one of file_token or folder_token is required".into()));
+    }
+    let payload = media_note_update_payload(file_token.as_deref(), folder_token.as_deref(), &note);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "media_note_update",
+        "file_token": file_token,
+        "folder_token": folder_token,
+        "note": note,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token, audit before/after, update, and patch the
+/// cache directly with the settled note.
+#[tauri::command]
+pub async fn media_note_update_commit(
+    app: AppHandle,
+    token: String,
+    file_token: Option<String>,
+    folder_token: Option<String>,
+    note: String,
+) -> AppResult<Value> {
+    if file_token.is_none() == folder_token.is_none() {
+        return Err(AppError::Other("exactly one of file_token or folder_token is required".into()));
+    }
+    let payload = media_note_update_payload(file_token.as_deref(), folder_token.as_deref(), &note);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    let target = file_token.clone().or_else(|| folder_token.clone()).unwrap_or_default();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "media_note_update", None, &[target],
+            None, Some(if note.is_empty() { "cleared" } else { "updated" }), false, true, &now,
+        )?;
+    }
+
+    let result = sync::media_note_update(&app, file_token.as_deref(), folder_token.as_deref(), &note).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for starting transcription.
+#[tauri::command]
+pub fn media_transcript_generate_prepare(state: State<'_, AppState>, file_token: String) -> AppResult<Value> {
+    let payload = media_transcript_generate_payload(&file_token);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({ "token": token, "action": "media_transcript_generate", "file_token": file_token, "count": 1 }))
+}
+
+/// Step 2: validate the token, audit before/after, kick off the job (caches
+/// it as `processing`) — the frontend then polls `fetch_media_job_status`.
+#[tauri::command]
+pub async fn media_transcript_generate_commit(app: AppHandle, token: String, file_token: String) -> AppResult<Value> {
+    let payload = media_transcript_generate_payload(&file_token);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "media_transcript_generate", None, &[file_token.clone()],
+            None, Some("processing"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::media_transcript_generate(&app, &file_token).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    let conn = app_state.db.lock().unwrap();
+    Ok(db::get_media_job(&conn, &file_token, "transcript")?.unwrap_or(Value::Null))
+}
+
+/// Step 1 of the write guardrail for starting a video scale-down.
+#[tauri::command]
+pub fn media_scale_down_prepare(state: State<'_, AppState>, file_token: String) -> AppResult<Value> {
+    let payload = media_scale_down_payload(&file_token);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({ "token": token, "action": "media_scale_down", "file_token": file_token, "count": 1 }))
+}
+
+/// Step 2: same shape as `media_transcript_generate_commit`, for scale-down.
+#[tauri::command]
+pub async fn media_scale_down_commit(app: AppHandle, token: String, file_token: String) -> AppResult<Value> {
+    let payload = media_scale_down_payload(&file_token);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "media_scale_down", None, &[file_token.clone()],
+            None, Some("processing"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::media_scale_down(&app, &file_token).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    let conn = app_state.db.lock().unwrap();
+    Ok(db::get_media_job(&conn, &file_token, "scale_down")?.unwrap_or(Value::Null))
+}
+
+/// Cached transcript body for one file, if a transcription has completed.
+#[tauri::command]
+pub fn get_media_transcript(state: State<'_, AppState>, file_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_media_transcript(&conn, &file_token)?.unwrap_or(Value::Null))
+}
+
+/// Cached job status (fast path; no network) — used to repaint immediately
+/// before the first poll round-trips.
+#[tauri::command]
+pub fn get_media_job_status(state: State<'_, AppState>, file_token: String, job_type: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_media_job(&conn, &file_token, &job_type)?.unwrap_or(Value::Null))
+}
+
+/// Poll one job's status (network + cache), returning the merged row. The
+/// frontend calls this on an interval until the status is terminal
+/// (`success`/`failed`); on `429` this propagates so the panel can back off
+/// and show a transient notice while keeping the last-known status visible.
+#[tauri::command]
+pub async fn fetch_media_job_status(app: AppHandle, file_token: String, job_type: String) -> AppResult<Value> {
+    sync::fetch_media_job_status(&app, &file_token, &job_type).await
 }

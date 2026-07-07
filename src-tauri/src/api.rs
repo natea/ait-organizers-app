@@ -831,6 +831,132 @@ impl ApiClient {
         }
         self.call("message_boards/direct_messages/post", body).await
     }
+
+    // ── Media video kit (specs/media-video-kit) ────────────────────────────
+    // The app's fifth write path, reusing the same write_guard prepare/commit
+    // gate as every other write feature. The Media API group is authorized
+    // ONLY for index owners and (mostly) `index_video_editor` — city owners,
+    // this app's primary audience, get `forbidden_role`/`forbidden_scope`/
+    // `forbidden_api_group` on every call here, which is the expected common
+    // case and handled by `sync::fetch_event_media`'s role-gated degradation,
+    // not treated as a client bug. All routes are GET/POST confirmed against
+    // openapi/openapi.yaml under /api/agents/v1/media/...; the two file-
+    // oriented transcript aliases (transcript/transcript_status/
+    // generate_transcript) are used throughout since the UI always operates
+    // on a specific file token (design: "file-oriented forms everywhere").
+
+    /// List a folder's children (subfolders + files), or the root when
+    /// `folder_token` is omitted (`media_folder_list`, GET, 30 rpm).
+    pub async fn media_folder_list(&self, folder_token: Option<&str>) -> AppResult<ApiOk> {
+        let q: Vec<(&str, String)> = match folder_token {
+            Some(t) => vec![("folder_token", t.to_string())],
+            None => vec![],
+        };
+        self.call_get("media/folders/list", &q).await
+    }
+
+    /// Folder detail plus its associated meetup/weblog (`media_folder_info`,
+    /// GET, 30 rpm) — the association sync uses to resolve an event's folder.
+    pub async fn media_folder_info(&self, folder_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/folders/info", &[("folder_token", folder_token.to_string())])
+            .await
+    }
+
+    /// Create a folder (`media_folder_create`, POST, 10 rpm). Exactly one of
+    /// `parent_token` (subfolder) / `weblog_token` (root-level) is expected by
+    /// the API; the caller (commands.rs) enforces that before this is reached.
+    pub async fn media_folder_create(&self, name: &str, parent_token: Option<&str>, weblog_token: Option<&str>) -> AppResult<ApiOk> {
+        let mut body = json!({ "name": name });
+        if let Some(p) = parent_token {
+            body["parent_token"] = json!(p);
+        }
+        if let Some(w) = weblog_token {
+            body["weblog_token"] = json!(w);
+        }
+        self.call("media/folders/create", body).await
+    }
+
+    /// Single file's metadata (`media_file_get`, GET, 60 rpm). Not on the
+    /// current sync path (folder listing already returns full file rows) —
+    /// kept for a future direct single-file refresh, mirroring `rsvp_get`.
+    #[allow(dead_code)]
+    pub async fn media_file_get(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/files/get", &[("file_token", file_token.to_string())]).await
+    }
+
+    /// Presigned, time-limited download URL (`media_file_download`, GET, 20
+    /// rpm) — the app never streams or caches the file body itself (spec).
+    pub async fn media_file_download(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/files/download", &[("file_token", file_token.to_string())]).await
+    }
+
+    /// Upload a file (`media_file_upload`, POST, 10 rpm, 30s timeout). The
+    /// caller (`sync::media_file_upload`) enforces the 50 MB cap BEFORE
+    /// base64-encoding — this method just sends whatever body it's given.
+    pub async fn media_file_upload(
+        &self,
+        filename: &str,
+        content_type: Option<&str>,
+        folder_token: &str,
+        body_base64: &str,
+        note: Option<&str>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({
+            "filename": filename,
+            "folder_token": folder_token,
+            "body_base64": body_base64,
+        });
+        if let Some(ct) = content_type {
+            body["content_type"] = json!(ct);
+        }
+        if let Some(n) = note {
+            body["note"] = json!(cap_chars(n, 2000));
+        }
+        self.call_timeout("media/files/upload", body, Some(Duration::from_secs(30))).await
+    }
+
+    /// Set/clear the sticky note on exactly one of a file or a folder
+    /// (`media_note_update`, POST, 20 rpm). Empty `note` clears it.
+    pub async fn media_note_update(&self, file_token: Option<&str>, folder_token: Option<&str>, note: &str) -> AppResult<ApiOk> {
+        let mut body = json!({ "note": cap_chars(note, 2000) });
+        if let Some(t) = file_token {
+            body["file_token"] = json!(t);
+        }
+        if let Some(t) = folder_token {
+            body["folder_token"] = json!(t);
+        }
+        self.call("media/notes/update", body).await
+    }
+
+    /// Kick off transcription (`media_file_transcript_generate` — the file-
+    /// oriented alias of `media_transcript_generate`, POST `.../files/
+    /// generate_transcript`, 5 rpm + 50/day). **Index owners only** — even
+    /// `index_video_editor` is refused (the one media endpoint that's
+    /// stricter than the rest).
+    pub async fn media_file_transcript_generate(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call("media/files/generate_transcript", json!({ "file_token": file_token })).await
+    }
+
+    /// Poll transcription status (`media_file_transcript_status`, GET, 60 rpm).
+    pub async fn media_file_transcript_status(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/files/transcript_status", &[("file_token", file_token.to_string())]).await
+    }
+
+    /// Fetch a completed transcript (`media_file_transcript_get`, GET, 30 rpm).
+    pub async fn media_file_transcript_get(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/files/transcript", &[("file_token", file_token.to_string())]).await
+    }
+
+    /// Kick off a video scale-down (`media_file_scale_down`, POST, 10 rpm).
+    pub async fn media_file_scale_down(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call("media/files/scale_down", json!({ "file_token": file_token })).await
+    }
+
+    /// Poll scale-down status (`media_file_scale_down_status`, GET, 60 rpm) —
+    /// the response carries the scaled file's full metadata once `success`.
+    pub async fn media_file_scale_down_status(&self, file_token: &str) -> AppResult<ApiOk> {
+        self.call_get("media/files/scale_down_status", &[("file_token", file_token.to_string())]).await
+    }
 }
 
 /// Char-safe truncation (never splits a multi-byte UTF-8 codepoint) for the
