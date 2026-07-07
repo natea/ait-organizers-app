@@ -2624,3 +2624,420 @@ pub async fn networking_direct_message_post(app: &AppHandle, client_refs: &[Stri
         Err(e) => Err(e),
     }
 }
+
+// ── Media video kit (specs/media-video-kit) ────────────────────────────────
+// The app's fifth write feature, reusing the same write_guard prepare/commit
+// gate as every other write feature. THE central complication here: the Media
+// API group is authorized ONLY for index owners and (mostly) `index_video_editor`
+// — city owners, this app's primary audience, get forbidden_* on every media
+// call. Design decision 6: sync records that once per event as
+// `media_availability` and short-circuits (no more calls for that event) —
+// this is the "MUST NOT keep hammering the API once blocked" requirement.
+
+const MEDIA_KEY: &str = "media";
+const MEDIA_WRITE_KEY: &str = "media_write";
+const MEDIA_JOB_POLL_KEY: &str = "media_job_poll";
+/// Hard ceiling on root-folder scan calls when resolving which folder belongs
+/// to an event (there's no direct meetup->folder lookup in the API — the only
+/// association is folder-carries-meetup via `media_folder_info`). Bounds the
+/// worst case to a handful of `media_folder_info` calls (30 rpm) rather than
+/// walking an unbounded root listing.
+const MEDIA_ROOT_SCAN_CAP: usize = 10;
+/// Enforced before base64-encoding (spec: "MUST reject files larger than 50 MB
+/// before base64-encoding" — base64 inflates payloads ~33%, so the guard must
+/// sit here, not on the encoded size).
+pub const MEDIA_UPLOAD_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+fn media_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        AppError::RateLimited(_) => "rate_limited",
+        _ => "unavailable",
+    }
+}
+
+/// Resolve which folder belongs to this event by scanning root folders and
+/// checking each one's `media_folder_info` association (design decision 1).
+/// Returns `Ok(None)` when no root folder matches (not an error — the event
+/// simply has no media folder yet). A capability block or rate limit on
+/// either call is propagated so the caller can degrade/backoff appropriately.
+async fn resolve_event_folder(app: &AppHandle, api: &crate::api::ApiClient, meetup_token: &str) -> AppResult<Option<String>> {
+    let root = api.media_folder_list(None).await?;
+    let folders = root.data.get("folders").and_then(Value::as_array).cloned().unwrap_or_default();
+    for folder in folders.iter().take(MEDIA_ROOT_SCAN_CAP) {
+        let Some(token) = folder.get("token").and_then(Value::as_str).map(str::to_string) else { continue };
+        let info = api.media_folder_info(&token).await?;
+        let matched = info
+            .data
+            .get("meetup")
+            .and_then(|m| m.get("token"))
+            .and_then(Value::as_str)
+            == Some(meetup_token);
+        if matched {
+            let now = iso_now();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_media_folder(&conn, folder, Some(meetup_token), &now)?;
+            record_rate_locked(&conn, MEDIA_KEY, &info.rate);
+            return Ok(Some(token));
+        }
+    }
+    Ok(None)
+}
+
+/// List one folder's children (subfolders + files) and cache them. When
+/// `meetup_token` is given (the event-root case), also updates
+/// `media_availability`'s folder_token/unavailable flag; a plain subfolder
+/// browse (no meetup_token) just refreshes that folder's contents.
+async fn list_and_cache_folder(app: &AppHandle, api: &crate::api::ApiClient, folder_token: &str, meetup_token: Option<&str>) -> AppResult<()> {
+    let now = iso_now();
+    let ok = api.media_folder_list(Some(folder_token)).await?;
+
+    let subfolders = ok.data.get("folders").and_then(Value::as_array).cloned().unwrap_or_default();
+    let files = ok.data.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    for sf in &subfolders {
+        let _ = db::upsert_media_folder(&conn, sf, None, &now);
+    }
+    let mut keep = Vec::new();
+    for f in &files {
+        if let Some(t) = db::upsert_media_file(&conn, folder_token, f, &now)? {
+            keep.push(t);
+        }
+    }
+    db::retain_media_files(&conn, folder_token, &keep)?;
+    record_rate_locked(&conn, MEDIA_KEY, &ok.rate);
+    if let Some(mt) = meetup_token {
+        db::set_media_availability(&conn, mt, Some(folder_token), false, None, &now)?;
+    }
+    Ok(())
+}
+
+/// Fetch + cache the Media view for one event: resolve its folder (once,
+/// then cached), list contents, and record role-gated unavailability instead
+/// of failing the rest of event detail (design decision 6). An explicit
+/// screen-open/manual-refresh action — never the poll loop.
+pub async fn fetch_event_media(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+
+    // Already recorded blocked for this event — stop hammering (task 4.2/spec
+    // "MUST NOT keep hammering the API once blocked"). Also picks up an
+    // already-resolved folder_token so we skip the root-folder scan entirely
+    // on repeat opens.
+    let cached_availability = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::get_media_availability(&conn, meetup_token)?
+    };
+    if cached_availability.as_ref().and_then(|a| a.get("unavailable")).and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    if in_backoff(app, MEDIA_KEY) {
+        return Ok(());
+    }
+
+    let cached_folder = cached_availability
+        .as_ref()
+        .and_then(|a| a.get("folder_token"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let folder_token = match cached_folder {
+        Some(ft) => Ok(Some(ft)),
+        None => resolve_event_folder(app, &api, meetup_token).await,
+    };
+
+    let now = iso_now();
+    match folder_token {
+        Ok(Some(ft)) => match list_and_cache_folder(app, &api, &ft, Some(meetup_token)).await {
+            Ok(()) => {}
+            Err(e) if e.is_capability_block() => {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::set_media_availability(&conn, meetup_token, Some(&ft), true, Some(media_error_code(&e)), &now)?;
+            }
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, MEDIA_KEY, parse_retry_after(&msg));
+                return Err(AppError::RateLimited(msg));
+            }
+            Err(e) => return Err(e),
+        },
+        Ok(None) => {
+            // No media folder found for this event (not a role-gated block —
+            // an authorized caller who simply hasn't created one yet).
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::set_media_availability(&conn, meetup_token, None, false, None, &now)?;
+        }
+        Err(e) if e.is_capability_block() => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::set_media_availability(&conn, meetup_token, None, true, Some(media_error_code(&e)), &now)?;
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(e) => return Err(e),
+    }
+
+    let _ = app.emit("media:updated", json!({ "meetup_token": meetup_token }));
+    Ok(())
+}
+
+/// Re-list one already-resolved folder (browsing into a subfolder, or the
+/// targeted re-sync after a write). Does not touch `media_availability` —
+/// that's only ever set at the event-root resolution in `fetch_event_media`.
+pub async fn fetch_media_folder(app: &AppHandle, folder_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, MEDIA_KEY) {
+        return Ok(());
+    }
+    match list_and_cache_folder(app, &api, folder_token, None).await {
+        Ok(()) => {
+            let _ = app.emit("media:folder_updated", json!({ "folder_token": folder_token }));
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Request a presigned download URL. Never caches the file body (spec) — the
+/// caller hands the URL straight to the OS/browser.
+pub async fn media_file_download(app: &AppHandle, file_token: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.media_file_download(file_token).await {
+        Ok(ok) => {
+            record_rate(app, MEDIA_KEY, &ok.rate);
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Create a folder. Called ONLY from `commands::media_folder_create_commit`
+/// after the write_guard token has been validated. On success, re-syncs the
+/// parent (or the event's resolved root) so the new folder appears from cache.
+pub async fn media_folder_create(app: &AppHandle, name: &str, parent_token: Option<&str>, weblog_token: Option<&str>) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.media_folder_create(name, parent_token, weblog_token).await {
+        Ok(ok) => {
+            let now = iso_now();
+            let folder = ok.data.get("folder").cloned().unwrap_or_else(|| ok.data.clone());
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::upsert_media_folder(&conn, &folder, None, &now)?;
+                record_rate_locked(&conn, MEDIA_WRITE_KEY, &ok.rate);
+            }
+            if let Some(pt) = parent_token {
+                let _ = fetch_media_folder(app, pt).await;
+            }
+            Ok(folder)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Read a local file, enforce the 50 MB cap BEFORE base64-encoding, upload it,
+/// and cache the resulting file row. Called ONLY from
+/// `commands::media_upload_commit` after the write_guard token has been
+/// validated (the size cap is also checked earlier, at `_prepare`, so an
+/// oversize file never even gets a confirmation token — this is the
+/// defensive second check).
+pub async fn media_file_upload(
+    app: &AppHandle,
+    folder_token: &str,
+    filename: &str,
+    content_type: Option<&str>,
+    file_path: &str,
+    note: Option<&str>,
+) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    let meta = std::fs::metadata(file_path).map_err(|e| AppError::Other(format!("could not read file: {e}")))?;
+    if meta.len() > MEDIA_UPLOAD_MAX_BYTES {
+        return Err(AppError::Other(format!(
+            "file is {} bytes, exceeding the 50 MB limit",
+            meta.len()
+        )));
+    }
+    let bytes = std::fs::read(file_path).map_err(|e| AppError::Other(format!("could not read file: {e}")))?;
+    let body_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+
+    match api.media_file_upload(filename, content_type, folder_token, &body_base64, note).await {
+        Ok(ok) => {
+            let now = iso_now();
+            let file = ok.data.get("file").cloned().unwrap_or_else(|| ok.data.clone());
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::upsert_media_file(&conn, folder_token, &file, &now)?;
+                record_rate_locked(&conn, MEDIA_WRITE_KEY, &ok.rate);
+            }
+            let _ = fetch_media_folder(app, folder_token).await;
+            Ok(file)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Set/clear the note on a file or folder. Called ONLY from
+/// `commands::media_note_update_commit` after the write_guard token has been
+/// validated. Patches the cache directly rather than a full re-sync — the
+/// response already carries the settled value.
+pub async fn media_note_update(app: &AppHandle, file_token: Option<&str>, folder_token: Option<&str>, note: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.media_note_update(file_token, folder_token, note).await {
+        Ok(ok) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::patch_media_note(&conn, file_token, folder_token, note)?;
+            record_rate_locked(&conn, MEDIA_WRITE_KEY, &ok.rate);
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Kick off transcription. Called ONLY from
+/// `commands::media_transcript_generate_commit`. **Index owners only** —
+/// `index_video_editor` is refused here even though it's allowed on nearly
+/// every other media endpoint (docs/agents-api.md authorization table).
+pub async fn media_transcript_generate(app: &AppHandle, file_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.media_file_transcript_generate(file_token).await {
+        Ok(ok) => {
+            let now = iso_now();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_media_job(&conn, file_token, "transcript", "processing", None, None, None, &now)?;
+            record_rate_locked(&conn, MEDIA_WRITE_KEY, &ok.rate);
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Kick off a video scale-down. Called ONLY from
+/// `commands::media_scale_down_commit`.
+pub async fn media_scale_down(app: &AppHandle, file_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.media_file_scale_down(file_token).await {
+        Ok(ok) => {
+            let now = iso_now();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_media_job(&conn, file_token, "scale_down", "processing", None, None, None, &now)?;
+            record_rate_locked(&conn, MEDIA_WRITE_KEY, &ok.rate);
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, MEDIA_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Poll one job's status to a terminal state (design decision 5), caching
+/// every observation. On a transcription success, fetches and caches the
+/// transcript; on a scale-down success, caches the `scaled_file` metadata the
+/// status response already carries (no extra call needed) into the same
+/// folder as the source file. Returns the merged cached job row so the
+/// frontend can render immediately without a second round trip.
+pub async fn fetch_media_job_status(app: &AppHandle, file_token: &str, job_type: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    if in_backoff(app, MEDIA_JOB_POLL_KEY) {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        return Ok(db::get_media_job(&conn, file_token, job_type)?.unwrap_or(Value::Null));
+    }
+    let now = iso_now();
+
+    if job_type == "transcript" {
+        match api.media_file_transcript_status(file_token).await {
+            Ok(ok) => {
+                let status = ok.data.get("transcript_status").and_then(Value::as_str).unwrap_or("processing").to_string();
+                let error = ok.data.get("transcript_error").and_then(Value::as_str).map(str::to_string);
+                let attempts = ok.data.get("transcript_attempts").and_then(Value::as_i64);
+                {
+                    let state = app.state::<AppState>();
+                    let conn = state.db.lock().unwrap();
+                    db::upsert_media_job(&conn, file_token, "transcript", &status, attempts, error.as_deref(), None, &now)?;
+                    record_rate_locked(&conn, MEDIA_JOB_POLL_KEY, &ok.rate);
+                }
+                if status == "success" {
+                    if let Ok(tr) = api.media_file_transcript_get(file_token).await {
+                        let text = tr.data.get("transcript_text").and_then(Value::as_str);
+                        let transcribed_at = tr.data.get("transcribed_at").and_then(Value::as_str);
+                        let state = app.state::<AppState>();
+                        let conn = state.db.lock().unwrap();
+                        db::upsert_media_transcript(&conn, file_token, text, tr.data.get("transcript"), transcribed_at, &now)?;
+                    }
+                }
+            }
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, MEDIA_JOB_POLL_KEY, parse_retry_after(&msg));
+                return Err(AppError::RateLimited(msg));
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        match api.media_file_scale_down_status(file_token).await {
+            Ok(ok) => {
+                let status = ok.data.get("scale_down_status").and_then(Value::as_str).unwrap_or("processing").to_string();
+                let error = ok.data.get("scale_down_error").and_then(Value::as_str).map(str::to_string);
+                let scaled_file = ok.data.get("scaled_file").cloned();
+                {
+                    let state = app.state::<AppState>();
+                    let conn = state.db.lock().unwrap();
+                    db::upsert_media_job(&conn, file_token, "scale_down", &status, None, error.as_deref(), scaled_file.as_ref(), &now)?;
+                    record_rate_locked(&conn, MEDIA_JOB_POLL_KEY, &ok.rate);
+                    if let (Some(sf), Some(orig)) = (&scaled_file, db::get_media_file(&conn, file_token)?) {
+                        let folder_token = orig.get("folder_token").and_then(Value::as_str).unwrap_or_default();
+                        if !folder_token.is_empty() {
+                            db::upsert_media_file(&conn, folder_token, sf, &now)?;
+                        }
+                    }
+                }
+            }
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, MEDIA_JOB_POLL_KEY, parse_retry_after(&msg));
+                return Err(AppError::RateLimited(msg));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_media_job(&conn, file_token, job_type)?.unwrap_or(Value::Null))
+}

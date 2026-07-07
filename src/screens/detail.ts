@@ -42,6 +42,7 @@ interface DetailOpts {
   onBack: () => void;
   onOpenScreening: (meetupToken: string, eventName: string) => void;
   onOpenSpeakers: (meetupToken: string, eventName: string) => void;
+  onOpenMedia: (meetupToken: string, eventName: string, weblogToken?: string) => void;
 }
 
 export interface DetailController {
@@ -194,6 +195,9 @@ export function mountDetail(opts: DetailOpts): DetailController {
     document.getElementById("speakerPipelineBtn")?.addEventListener("click", () => {
       opts.onOpenSpeakers(ev.meetup_token, ev.event_name);
     });
+    document.getElementById("mediaBtn")?.addEventListener("click", () => {
+      opts.onOpenMedia(ev.meetup_token, ev.event_name, ev.weblog_token);
+    });
     paintEmail();
     paintSurveyFollowup();
     promote.paint();
@@ -277,6 +281,7 @@ function bodyHTML(ev: EventObj): string {
       <div class="d-head-actions">
         <button class="btn-ghost" id="screenAttendeesBtn">Screen attendees</button>
         <button class="btn-ghost" id="speakerPipelineBtn">Speaker pipeline</button>
+        <button class="btn-ghost" id="mediaBtn">Media</button>
         ${chip}
       </div>
     </div>

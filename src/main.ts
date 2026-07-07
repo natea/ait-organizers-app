@@ -11,6 +11,7 @@ import { mountScreening, type ScreeningController } from "./screens/screening";
 import { mountSpeakers, type SpeakersController } from "./screens/speakers";
 import { mountCheckin, type CheckinController } from "./screens/checkin";
 import { mountNetworking, type NetworkingController } from "./screens/networking";
+import { mountMedia, type MediaController } from "./screens/media";
 import { mountSettings, type SettingsController } from "./screens/settings";
 
 type ScreenId =
@@ -23,6 +24,7 @@ type ScreenId =
   | "scr-speakers"
   | "scr-checkin"
   | "scr-boards"
+  | "scr-media"
   | "scr-settings";
 
 let overview: OverviewController | null = null;
@@ -33,6 +35,7 @@ let screening: ScreeningController | null = null;
 let speakers: SpeakersController | null = null;
 let checkin: CheckinController | null = null;
 let boards: NetworkingController | null = null;
+let media: MediaController | null = null;
 let settings: SettingsController | null = null;
 let currentDetailToken: string | null = null;
 
@@ -84,6 +87,10 @@ function enterApp(): void {
       show("scr-speakers");
       void speakers?.open(token, name);
     },
+    onOpenMedia: (token, name, weblogToken) => {
+      show("scr-media");
+      void media?.open(token, name, weblogToken);
+    },
   });
   screening = mountScreening({
     onBack: () => {
@@ -117,6 +124,17 @@ function enterApp(): void {
     onBack: () => {
       show("scr-overview");
       overview?.reload();
+    },
+  });
+  media = mountMedia({
+    onBack: () => {
+      if (currentDetailToken) {
+        show("scr-detail");
+        void detail?.refresh(currentDetailToken);
+      } else {
+        show("scr-overview");
+        overview?.reload();
+      }
     },
   });
   email = mountEmail({

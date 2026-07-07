@@ -459,6 +459,80 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             updated_at   TEXT NOT NULL,
             PRIMARY KEY (post_token, reason)
         );
+
+        -- Media video kit (specs/media-video-kit). The app's fifth write
+        -- feature, reusing `write_guard` + `write_audit` — no bespoke audit
+        -- path. Media is authorized ONLY for index owners / `index_video_editor`
+        -- (city owners, this app's primary audience, are NOT authorized), so
+        -- role-gated degradation is a first-class requirement (design decision 6).
+        CREATE TABLE IF NOT EXISTS media_folders (
+            folder_token  TEXT PRIMARY KEY,
+            parent_token  TEXT,
+            name          TEXT,
+            weblog_token  TEXT,
+            meetup_token  TEXT,
+            note          TEXT,
+            raw_json      TEXT,
+            synced_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_folders_meetup ON media_folders(meetup_token);
+        CREATE INDEX IF NOT EXISTS idx_media_folders_parent ON media_folders(parent_token);
+
+        CREATE TABLE IF NOT EXISTS media_files (
+            file_token     TEXT PRIMARY KEY,
+            folder_token   TEXT NOT NULL,
+            filename       TEXT,
+            content_type   TEXT,
+            size_in_bytes  INTEGER,
+            uploader_name  TEXT,
+            created_at     TEXT,
+            note           TEXT,
+            has_transcript INTEGER NOT NULL DEFAULT 0,
+            raw_json       TEXT,
+            synced_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_files_folder ON media_files(folder_token);
+
+        -- Cached transcript body (text + parsed JSON), fetched once a
+        -- transcription job reaches `success` (design decision 5).
+        CREATE TABLE IF NOT EXISTS media_transcripts (
+            file_token      TEXT PRIMARY KEY,
+            transcript_text TEXT,
+            transcript_json TEXT,
+            transcribed_at  TEXT,
+            synced_at       TEXT NOT NULL
+        );
+
+        -- Async job status for transcription / scale-down (design decision 5),
+        -- keyed by (file_token, job_type) so a file can have both in flight
+        -- independently. `result_json` holds the scaled-file metadata on a
+        -- scale_down success (task 2.5's "re-sync so the scaled file's
+        -- metadata appears from the cache" — the status response already
+        -- carries it, no extra call needed).
+        CREATE TABLE IF NOT EXISTS media_jobs (
+            file_token    TEXT NOT NULL,
+            job_type      TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'processing',
+            attempts      INTEGER,
+            error_detail  TEXT,
+            result_json   TEXT,
+            updated_at    TEXT NOT NULL,
+            PRIMARY KEY (file_token, job_type)
+        );
+
+        -- Per-event role-gated availability flag (design decision 6). Recorded
+        -- by sync the first time any media call for the event returns
+        -- forbidden_role/forbidden_scope/forbidden_api_group, instead of
+        -- failing the rest of event detail. Once unavailable=1, sync MUST NOT
+        -- keep probing this event's media on every open (spec: "MUST NOT keep
+        -- hammering the API once blocked").
+        CREATE TABLE IF NOT EXISTS media_availability (
+            meetup_token  TEXT PRIMARY KEY,
+            folder_token  TEXT,
+            unavailable   INTEGER NOT NULL DEFAULT 0,
+            reason        TEXT,
+            updated_at    TEXT NOT NULL
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -2942,6 +3016,341 @@ pub fn retain_flagged_posts(conn: &Connection, reason: &str, keep: &[String]) ->
     Ok(())
 }
 
+// ── Media video kit (specs/media-video-kit) ────────────────────────────────
+// The app's fifth write feature. Browsing (folders/files/notes/transcripts)
+// renders only from these caches; writes (upload, folder create, note update,
+// transcription/scale-down kickoff) reuse `write_guard` + `write_audit` — no
+// bespoke audit path. City owners are not authorized for any media endpoint
+// (design decision 6), so `media_availability` records that once and sync
+// stops probing rather than re-erroring on every open.
+
+fn media_folder_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "folder_token": r.get::<_, String>(0)?,
+        "parent_token": r.get::<_, Option<String>>(1)?,
+        "name": r.get::<_, Option<String>>(2)?,
+        "weblog_token": r.get::<_, Option<String>>(3)?,
+        "meetup_token": r.get::<_, Option<String>>(4)?,
+        "note": r.get::<_, Option<String>>(5)?,
+        "updated_at": r.get::<_, String>(6)?,
+    }))
+}
+
+const MEDIA_FOLDER_COLS: &str = "folder_token, parent_token, name, weblog_token, meetup_token, note, synced_at";
+
+/// Upsert one folder row from `media_folder_list`/`media_folder_info`/
+/// `media_folder_create`. `meetup_token` is only passed once resolved (the
+/// folder_info association) — a plain listing leaves it untouched via COALESCE
+/// so a subfolder doesn't lose an inherited association it never had to begin
+/// with (subfolders have no meetup of their own).
+pub fn upsert_media_folder(
+    conn: &Connection,
+    folder: &Value,
+    meetup_token: Option<&str>,
+    now: &str,
+) -> AppResult<Option<String>> {
+    let Some(token) = pick_str(folder, &["token", "folder_token"]) else { return Ok(None) };
+    let parent = pick_str(folder, &["parent_token"]);
+    let name = pick_str(folder, &["name"]);
+    let weblog = pick_str(folder, &["weblog_token"]);
+    let note = pick_str(folder, &["note"]);
+    conn.execute(
+        "INSERT INTO media_folders (folder_token, parent_token, name, weblog_token, meetup_token, note, raw_json, synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(folder_token) DO UPDATE SET
+           parent_token=excluded.parent_token,
+           name=excluded.name,
+           weblog_token=COALESCE(excluded.weblog_token, media_folders.weblog_token),
+           meetup_token=COALESCE(excluded.meetup_token, media_folders.meetup_token),
+           note=excluded.note,
+           raw_json=excluded.raw_json,
+           synced_at=excluded.synced_at",
+        params![token, parent, name, weblog, meetup_token, note, folder.to_string(), now],
+    )?;
+    Ok(Some(token.to_string()))
+}
+
+pub fn get_media_folder(conn: &Connection, folder_token: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {MEDIA_FOLDER_COLS} FROM media_folders WHERE folder_token = ?1");
+    let row = conn.query_row(&sql, params![folder_token], media_folder_row).optional()?;
+    Ok(row)
+}
+
+/// Direct children (subfolders) of one folder, name-sorted.
+pub fn get_media_subfolders(conn: &Connection, folder_token: &str) -> AppResult<Vec<Value>> {
+    let sql = format!(
+        "SELECT {MEDIA_FOLDER_COLS} FROM media_folders WHERE parent_token = ?1 ORDER BY (name IS NULL), name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![folder_token], media_folder_row)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// The folder resolved for one event, if any (design decision 1: "an
+/// event-scoped view driven by the folder-meetup link"). Exercised directly
+/// by the db.rs tests; `get_media_view` is the path the app itself uses.
+#[allow(dead_code)]
+pub fn get_media_folder_for_meetup(conn: &Connection, meetup_token: &str) -> AppResult<Option<Value>> {
+    let sql = format!(
+        "SELECT {MEDIA_FOLDER_COLS} FROM media_folders WHERE meetup_token = ?1 LIMIT 1"
+    );
+    let row = conn.query_row(&sql, params![meetup_token], media_folder_row).optional()?;
+    Ok(row)
+}
+
+fn media_file_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "file_token": r.get::<_, String>(0)?,
+        "folder_token": r.get::<_, String>(1)?,
+        "filename": r.get::<_, Option<String>>(2)?,
+        "content_type": r.get::<_, Option<String>>(3)?,
+        "size_in_bytes": r.get::<_, Option<i64>>(4)?,
+        "uploader_name": r.get::<_, Option<String>>(5)?,
+        "created_at": r.get::<_, Option<String>>(6)?,
+        "note": r.get::<_, Option<String>>(7)?,
+        "has_transcript": r.get::<_, i64>(8)? != 0,
+        "updated_at": r.get::<_, String>(9)?,
+    }))
+}
+
+const MEDIA_FILE_COLS: &str = "file_token, folder_token, filename, content_type, size_in_bytes,
+    uploader_name, created_at, note, has_transcript, synced_at";
+
+/// Upsert one file row from `media_file_get`/`media_folder_list`/
+/// `media_file_upload`/a scale-down's `scaled_file`.
+pub fn upsert_media_file(conn: &Connection, folder_token: &str, file: &Value, now: &str) -> AppResult<Option<String>> {
+    let Some(token) = pick_str(file, &["token", "file_token"]) else { return Ok(None) };
+    let filename = pick_str(file, &["filename"]);
+    let content_type = pick_str(file, &["content_type"]);
+    let size = pick_num(file, &["size_in_bytes", "size"]).map(|f| f as i64);
+    let uploader = pick_str(file, &["uploader_name"]);
+    let created_at = pick_str(file, &["created_at"]);
+    let note = pick_str(file, &["note"]);
+    let has_transcript = file.get("has_transcript").and_then(Value::as_bool).unwrap_or(false)
+        || file.get("transcript_status").and_then(Value::as_str) == Some("success");
+    conn.execute(
+        "INSERT INTO media_files
+           (file_token, folder_token, filename, content_type, size_in_bytes, uploader_name, created_at, note, has_transcript, raw_json, synced_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(file_token) DO UPDATE SET
+           folder_token=excluded.folder_token,
+           filename=excluded.filename,
+           content_type=excluded.content_type,
+           size_in_bytes=excluded.size_in_bytes,
+           uploader_name=excluded.uploader_name,
+           created_at=excluded.created_at,
+           note=excluded.note,
+           has_transcript=excluded.has_transcript,
+           raw_json=excluded.raw_json,
+           synced_at=excluded.synced_at",
+        params![token, folder_token, filename, content_type, size, uploader, created_at, note, has_transcript as i64, file.to_string(), now],
+    )?;
+    Ok(Some(token.to_string()))
+}
+
+/// Files directly inside one folder, name-sorted.
+pub fn get_media_files(conn: &Connection, folder_token: &str) -> AppResult<Vec<Value>> {
+    let sql = format!(
+        "SELECT {MEDIA_FILE_COLS} FROM media_files WHERE folder_token = ?1 ORDER BY (filename IS NULL), filename"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![folder_token], media_file_row)?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+pub fn get_media_file(conn: &Connection, file_token: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {MEDIA_FILE_COLS} FROM media_files WHERE file_token = ?1");
+    let row = conn.query_row(&sql, params![file_token], media_file_row).optional()?;
+    Ok(row)
+}
+
+/// Evict files of one folder no longer returned by the latest listing sweep
+/// (mirrors `retain_rsvp_rows`) — only called on a successful listing.
+pub fn retain_media_files(conn: &Connection, folder_token: &str, keep: &[String]) -> AppResult<()> {
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT file_token FROM media_files WHERE folder_token = ?1")?;
+        let rows = stmt.query_map(params![folder_token], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    for token in existing {
+        if !keep.iter().any(|k| k == &token) {
+            conn.execute("DELETE FROM media_files WHERE file_token = ?1", params![token])?;
+        }
+    }
+    Ok(())
+}
+
+/// Set or clear the note directly on the affected file/folder row (targeted
+/// patch, not a full re-sync — the response already tells us the new value).
+pub fn patch_media_note(conn: &Connection, file_token: Option<&str>, folder_token: Option<&str>, note: &str) -> AppResult<()> {
+    let note_opt = if note.is_empty() { None } else { Some(note) };
+    if let Some(ft) = file_token {
+        conn.execute("UPDATE media_files SET note = ?2 WHERE file_token = ?1", params![ft, note_opt])?;
+    }
+    if let Some(ft) = folder_token {
+        conn.execute("UPDATE media_folders SET note = ?2 WHERE folder_token = ?1", params![ft, note_opt])?;
+    }
+    Ok(())
+}
+
+/// Cache a transcript body (task 2.x "on success fetch and cache the transcript").
+pub fn upsert_media_transcript(conn: &Connection, file_token: &str, transcript_text: Option<&str>, transcript_json: Option<&Value>, transcribed_at: Option<&str>, now: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO media_transcripts (file_token, transcript_text, transcript_json, transcribed_at, synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(file_token) DO UPDATE SET
+           transcript_text=excluded.transcript_text,
+           transcript_json=excluded.transcript_json,
+           transcribed_at=excluded.transcribed_at,
+           synced_at=excluded.synced_at",
+        params![file_token, transcript_text, transcript_json.map(|v| v.to_string()), transcribed_at, now],
+    )?;
+    conn.execute("UPDATE media_files SET has_transcript = 1 WHERE file_token = ?1", params![file_token])?;
+    Ok(())
+}
+
+pub fn get_media_transcript(conn: &Connection, file_token: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT transcript_text, transcript_json, transcribed_at FROM media_transcripts WHERE file_token = ?1",
+            params![file_token],
+            |r| {
+                Ok(json!({
+                    "file_token": file_token,
+                    "transcript_text": r.get::<_, Option<String>>(0)?,
+                    "transcript_json": r.get::<_, Option<String>>(1)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "transcribed_at": r.get::<_, Option<String>>(2)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upsert a transcription/scale-down job observation (design decision 5's
+/// "caching each observation in media_jobs"). `result_json` is only meaningful
+/// for a scale-down `success` (the scaled file's metadata).
+pub fn upsert_media_job(
+    conn: &Connection,
+    file_token: &str,
+    job_type: &str,
+    status: &str,
+    attempts: Option<i64>,
+    error_detail: Option<&str>,
+    result: Option<&Value>,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO media_jobs (file_token, job_type, status, attempts, error_detail, result_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(file_token, job_type) DO UPDATE SET
+           status=excluded.status,
+           attempts=COALESCE(excluded.attempts, media_jobs.attempts),
+           error_detail=excluded.error_detail,
+           result_json=COALESCE(excluded.result_json, media_jobs.result_json),
+           updated_at=excluded.updated_at",
+        params![file_token, job_type, status, attempts, error_detail, result.map(|v| v.to_string()), now],
+    )?;
+    Ok(())
+}
+
+pub fn get_media_job(conn: &Connection, file_token: &str, job_type: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT status, attempts, error_detail, result_json, updated_at FROM media_jobs WHERE file_token = ?1 AND job_type = ?2",
+            params![file_token, job_type],
+            |r| {
+                Ok(json!({
+                    "file_token": file_token,
+                    "job_type": job_type,
+                    "status": r.get::<_, String>(0)?,
+                    "attempts": r.get::<_, Option<i64>>(1)?,
+                    "error_detail": r.get::<_, Option<String>>(2)?,
+                    "result": r.get::<_, Option<String>>(3)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "updated_at": r.get::<_, String>(4)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Record (or clear) the per-event role-gated availability flag (design
+/// decision 6). Once `unavailable=1`, `sync::fetch_event_media` checks this
+/// BEFORE issuing any media call for the event and no-ops — the spec's "MUST
+/// NOT keep hammering the API once blocked".
+pub fn set_media_availability(conn: &Connection, meetup_token: &str, folder_token: Option<&str>, unavailable: bool, reason: Option<&str>, now: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO media_availability (meetup_token, folder_token, unavailable, reason, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(meetup_token) DO UPDATE SET
+           folder_token=COALESCE(excluded.folder_token, media_availability.folder_token),
+           unavailable=excluded.unavailable,
+           reason=excluded.reason,
+           updated_at=excluded.updated_at",
+        params![meetup_token, folder_token, unavailable as i64, reason, now],
+    )?;
+    Ok(())
+}
+
+pub fn get_media_availability(conn: &Connection, meetup_token: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT folder_token, unavailable, reason, updated_at FROM media_availability WHERE meetup_token = ?1",
+            params![meetup_token],
+            |r| {
+                Ok(json!({
+                    "meetup_token": meetup_token,
+                    "folder_token": r.get::<_, Option<String>>(0)?,
+                    "unavailable": r.get::<_, i64>(1)? != 0,
+                    "reason": r.get::<_, Option<String>>(2)?,
+                    "updated_at": r.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Folder + subfolders + files for an arbitrary already-resolved folder_token
+/// (browsing into a subfolder) — same shape as `get_media_view` minus the
+/// per-event availability header.
+pub fn get_media_folder_view(conn: &Connection, folder_token: &str) -> AppResult<Value> {
+    Ok(json!({
+        "folder": get_media_folder(conn, folder_token)?,
+        "subfolders": get_media_subfolders(conn, folder_token)?,
+        "files": get_media_files(conn, folder_token)?,
+    }))
+}
+
+/// The full Media view for one event: availability header, the resolved
+/// folder (with ancestors omitted — only current + children, per the
+/// event-scoped decision), its subfolders, and its files. Renders entirely
+/// from cache (spec: "the view MUST NOT issue read calls directly").
+pub fn get_media_view(conn: &Connection, meetup_token: &str) -> AppResult<Value> {
+    let availability = get_media_availability(conn, meetup_token)?.unwrap_or_else(|| {
+        json!({ "meetup_token": meetup_token, "folder_token": Value::Null, "unavailable": false, "reason": Value::Null, "updated_at": Value::Null })
+    });
+    let folder_token = availability.get("folder_token").and_then(Value::as_str).map(str::to_string);
+    let (folder, subfolders, files) = match &folder_token {
+        Some(ft) => (
+            get_media_folder(conn, ft)?,
+            get_media_subfolders(conn, ft)?,
+            get_media_files(conn, ft)?,
+        ),
+        None => (None, Vec::new(), Vec::new()),
+    };
+    Ok(json!({
+        "meetup_token": meetup_token,
+        "availability": availability,
+        "folder": folder,
+        "subfolders": subfolders,
+        "files": files,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3985,5 +4394,119 @@ mod tests {
         let dm_row = get_write_audit(&c, "aud2").unwrap().unwrap();
         assert_eq!(dm_row.get("action").and_then(Value::as_str), Some("direct_message_post_create"));
         assert_eq!(dm_row.get("outcome").and_then(Value::as_str), Some("forbidden_scope"));
+    }
+
+    // ── Media video kit (specs/media-video-kit) ─────────────────────────────
+
+    #[test]
+    fn folder_and_file_cache_round_trip() {
+        let c = mem();
+        upsert_media_folder(&c, &json!({ "token": "f1", "name": "Demo Night", "weblog_token": "w1" }), Some("m1"), "t1").unwrap();
+        upsert_media_folder(&c, &json!({ "token": "f2", "parent_token": "f1", "name": "Raw" }), None, "t1").unwrap();
+        upsert_media_file(&c, "f1", &json!({ "token": "file1", "filename": "clip.mp4", "content_type": "video/mp4", "size_in_bytes": 1024, "uploader_name": "Ashley" }), "t1").unwrap();
+
+        let folder = get_media_folder(&c, "f1").unwrap().expect("folder must be cached");
+        assert_eq!(folder.get("name").and_then(Value::as_str), Some("Demo Night"));
+        assert_eq!(folder.get("meetup_token").and_then(Value::as_str), Some("m1"));
+
+        let by_meetup = get_media_folder_for_meetup(&c, "m1").unwrap().expect("resolvable by meetup_token");
+        assert_eq!(by_meetup.get("folder_token").and_then(Value::as_str), Some("f1"));
+
+        let subfolders = get_media_subfolders(&c, "f1").unwrap();
+        assert_eq!(subfolders.len(), 1);
+        assert_eq!(subfolders[0].get("folder_token").and_then(Value::as_str), Some("f2"));
+
+        let files = get_media_files(&c, "f1").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].get("filename").and_then(Value::as_str), Some("clip.mp4"));
+        assert_eq!(files[0].get("size_in_bytes").and_then(Value::as_i64), Some(1024));
+
+        // A fresh listing sweep that no longer returns file1 must evict it.
+        retain_media_files(&c, "f1", &[]).unwrap();
+        assert!(get_media_files(&c, "f1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_update_is_reflected_on_the_file_and_can_be_cleared() {
+        let c = mem();
+        upsert_media_folder(&c, &json!({ "token": "f1", "name": "Demo Night" }), Some("m1"), "t1").unwrap();
+        upsert_media_file(&c, "f1", &json!({ "token": "file1", "filename": "clip.mp4" }), "t1").unwrap();
+
+        patch_media_note(&c, Some("file1"), None, "Great b-roll").unwrap();
+        let file = get_media_file(&c, "file1").unwrap().unwrap();
+        assert_eq!(file.get("note").and_then(Value::as_str), Some("Great b-roll"));
+
+        // Empty note clears it (spec: "Passing an empty note MUST clear it").
+        patch_media_note(&c, Some("file1"), None, "").unwrap();
+        let cleared = get_media_file(&c, "file1").unwrap().unwrap();
+        assert_eq!(cleared.get("note"), Some(&Value::Null));
+
+        patch_media_note(&c, None, Some("f1"), "Root of the event's clips").unwrap();
+        let folder = get_media_folder(&c, "f1").unwrap().unwrap();
+        assert_eq!(folder.get("note").and_then(Value::as_str), Some("Root of the event's clips"));
+    }
+
+    #[test]
+    fn transcription_job_status_transitions_persist_and_cache_the_transcript_on_success() {
+        let c = mem();
+        upsert_media_folder(&c, &json!({ "token": "f1" }), Some("m1"), "t1").unwrap();
+        upsert_media_file(&c, "f1", &json!({ "token": "file1", "filename": "talk.mp4" }), "t1").unwrap();
+
+        upsert_media_job(&c, "file1", "transcript", "processing", Some(1), None, None, "t1").unwrap();
+        let processing = get_media_job(&c, "file1", "transcript").unwrap().unwrap();
+        assert_eq!(processing.get("status").and_then(Value::as_str), Some("processing"));
+
+        upsert_media_job(&c, "file1", "transcript", "success", Some(1), None, None, "t2").unwrap();
+        upsert_media_transcript(&c, "file1", Some("hello world"), Some(&json!({"paragraphs": []})), Some("t2"), "t2").unwrap();
+
+        let done = get_media_job(&c, "file1", "transcript").unwrap().unwrap();
+        assert_eq!(done.get("status").and_then(Value::as_str), Some("success"));
+        let transcript = get_media_transcript(&c, "file1").unwrap().expect("transcript cached on success");
+        assert_eq!(transcript.get("transcript_text").and_then(Value::as_str), Some("hello world"));
+        let file = get_media_file(&c, "file1").unwrap().unwrap();
+        assert_eq!(file.get("has_transcript").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn scale_down_job_failure_records_error_detail_and_attempts() {
+        let c = mem();
+        upsert_media_job(&c, "file1", "scale_down", "processing", Some(1), None, None, "t1").unwrap();
+        upsert_media_job(&c, "file1", "scale_down", "failed", Some(2), Some("encoder timeout"), None, "t2").unwrap();
+        let job = get_media_job(&c, "file1", "scale_down").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(job.get("attempts").and_then(Value::as_i64), Some(2));
+        assert_eq!(job.get("error_detail").and_then(Value::as_str), Some("encoder timeout"));
+    }
+
+    #[test]
+    fn role_gated_blocked_state_is_recorded_and_the_view_reflects_it() {
+        // City owners are not authorized for the Media group (design decision
+        // 6) — once sync records this, get_media_view must surface it without
+        // needing any folder/file rows to be cached.
+        let c = mem();
+        set_media_availability(&c, "m1", None, true, Some("forbidden_role"), "t1").unwrap();
+
+        let availability = get_media_availability(&c, "m1").unwrap().unwrap();
+        assert_eq!(availability.get("unavailable").and_then(Value::as_bool), Some(true));
+        assert_eq!(availability.get("reason").and_then(Value::as_str), Some("forbidden_role"));
+
+        let view = get_media_view(&c, "m1").unwrap();
+        assert_eq!(view.get("availability").and_then(|a| a.get("unavailable")).and_then(Value::as_bool), Some(true));
+        assert_eq!(view.get("folder"), Some(&Value::Null));
+        assert!(view.get("files").and_then(Value::as_array).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_write_audit_reuses_the_shared_table_and_rejects_replay() {
+        // Media reuses the same write_guard + write_audit as every other write
+        // feature — no bespoke audit path for uploads.
+        let c = mem();
+        insert_write_audit(&c, "aud1", "media_file_upload", Some("m1"), &["clip.mp4".to_string()], None, Some("uploaded"), false, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        let row = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(row.get("action").and_then(Value::as_str), Some("media_file_upload"));
+        assert_eq!(row.get("outcome").and_then(Value::as_str), Some("ok"));
+        let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1, "one committed upload is exactly one audit row, not replayable into a second");
     }
 }
