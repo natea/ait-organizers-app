@@ -5,6 +5,7 @@ mod error;
 mod keychain;
 mod state;
 mod sync;
+mod write_guard;
 
 use std::time::Duration;
 
@@ -111,6 +112,15 @@ pub fn run() {
             commands::get_notifications_enabled,
             commands::open_main,
             commands::hide_popover,
+            commands::get_rsvp_list,
+            commands::fetch_rsvp_list,
+            commands::get_rsvp_detail,
+            commands::fetch_rsvp_detail,
+            commands::get_write_audit,
+            commands::rsvp_state_update_prepare,
+            commands::rsvp_state_update_commit,
+            commands::rsvp_bulk_state_update_prepare,
+            commands::rsvp_bulk_state_update_commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6,6 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::AppResult;
 use crate::keychain;
+use crate::write_guard::WriteGuard;
 
 /// Shared application state. The SQLite connection is the single source of
 /// truth for the UI (design D2); the frontend never calls the API directly.
@@ -33,6 +34,9 @@ pub struct AppState {
     /// `promo_jobs`, kept as a separate registry since the two features have
     /// independent job tables and id spaces.
     pub sponsor_jobs: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
+    /// The write guardrail (specs/rsvp-screening design D2/D3) — the shared
+    /// prepare/commit confirmation gate every write feature reuses.
+    pub write_guard: WriteGuard,
 }
 
 impl AppState {
@@ -45,6 +49,7 @@ impl AppState {
             syncing: AtomicBool::new(false),
             promo_jobs: Mutex::new(HashMap::new()),
             sponsor_jobs: Mutex::new(HashMap::new()),
+            write_guard: WriteGuard::default(),
         }
     }
 

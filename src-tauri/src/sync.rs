@@ -20,7 +20,7 @@ const PAST_LIMIT: u32 = 50;
 // only briefly.
 const MAX_BACKOFF_SECS: i64 = 6 * 3600;
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     Utc::now().to_rfc3339()
 }
 
@@ -1664,4 +1664,239 @@ pub fn next_event_json(app: &AppHandle) -> Option<Value> {
         "waitlisted": rsvps.get("waitlisted"),
         "cancelled": rsvps.get("cancelled"),
     }))
+}
+
+// ── RSVP screening (specs/rsvp-screening) ───────────────────────────────────
+// The attendee list is an explicit-action fetch (screen open / manual
+// refresh), never the 2-minute poll loop — same posture as email/sponsor
+// tools. The two mutation entry points below are the app's first writes; both
+// are only ever invoked from commands.rs AFTER the write_guard confirmation
+// token has been validated (design D1/D2).
+
+const RSVP_LIST_KEY: &str = "rsvp_screening";
+const RSVP_WRITE_KEY: &str = "rsvp_write";
+/// `rsvp_search` caps at 25 results/call (docs/agents-api.md). Two calls
+/// (default active states, then `denied`) give the triage view enough
+/// coverage without spending the tight 30rpm budget on exhaustive paging.
+const RSVP_SEARCH_LIMIT: u32 = 25;
+
+fn rsvp_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        AppError::RateLimited(_) => "rate_limited",
+        _ => "unavailable",
+    }
+}
+
+/// Fetch + cache the attendee list for one event (task 1.4). Degrades
+/// non-blockingly on a capability block; on rate limit, backs off and
+/// propagates so the caller can surface it (this is a read, so callers may
+/// retry later — unlike writes, reads are allowed their own backoff/retry).
+pub async fn fetch_rsvp_list(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, RSVP_LIST_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    let mut keep: Vec<String> = Vec::new();
+    let mut blocked: Option<String> = None;
+
+    // Pass 1: default active states (registered/attending/waitlisted per the
+    // API's default). Pass 2: denied, fetched separately so declined
+    // registrants stay visible for audit/undo without a bespoke states param.
+    for status in [None, Some("denied")] {
+        match api.rsvp_search(meetup_token, status, None, RSVP_SEARCH_LIMIT).await {
+            Ok(ok) => {
+                let rows = ok
+                    .data
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                for row in &rows {
+                    if let Some(rref) = db::upsert_rsvp_row(&conn, meetup_token, row, &now)? {
+                        keep.push(rref);
+                    }
+                }
+                record_rate_locked(&conn, RSVP_LIST_KEY, &ok.rate);
+            }
+            Err(e) if e.is_capability_block() => {
+                blocked = Some(rsvp_error_code(&e).to_string());
+                break;
+            }
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, RSVP_LIST_KEY, parse_retry_after(&msg));
+                return Err(AppError::RateLimited(msg));
+            }
+            Err(_) => {}
+        }
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        // A blocked fetch leaves the previously-cached rows in place rather
+        // than evicting them (same "degrade, don't erase" posture as
+        // sponsor_search) — only a successful sweep retires stale rows.
+        if blocked.is_none() {
+            db::retain_rsvp_rows(&conn, meetup_token, &keep)?;
+        }
+        db::set_sync_state(&conn, RSVP_LIST_KEY, Some(&now), None, None, blocked.is_some(), blocked.as_deref())?;
+    }
+
+    let _ = app.emit("rsvp_list:updated", json!({ "meetup_token": meetup_token }));
+    Ok(())
+}
+
+/// Fetch + cache one registrant's assessment, status history, and subscriber
+/// score breakdown (task 1.4/requirement "RSVP status history and score
+/// detail"). Each source degrades independently.
+pub async fn fetch_rsvp_detail(app: &AppHandle, rsvp_ref: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    let now = iso_now();
+
+    let assessment: (Option<Value>, &'static str) = match api.rsvp_assessment_get(rsvp_ref).await {
+        Ok(ok) => (Some(ok.data), "ok"),
+        Err(e) if e.is_capability_block() => (None, rsvp_error_code(&e)),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, "rsvp_assessment", parse_retry_after(&msg));
+            (None, "unavailable")
+        }
+        Err(_) => (None, "unavailable"),
+    };
+
+    let history: (Option<Value>, &'static str) = match api.rsvp_status_history_list(rsvp_ref, 50).await {
+        Ok(ok) => (Some(ok.data), "ok"),
+        Err(e) if e.is_capability_block() => (None, rsvp_error_code(&e)),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, "rsvp_history", parse_retry_after(&msg));
+            (None, "unavailable")
+        }
+        Err(_) => (None, "unavailable"),
+    };
+
+    // Subscriber score needs a subscriber_ref, which isn't always resolvable
+    // from an RSVP alone — degrade to "unavailable" rather than erroring when
+    // we can't identify one, without spending a call we know will fail.
+    let subscriber_ref = assessment
+        .0
+        .as_ref()
+        .and_then(|a| db::pick_str(a, &["subscriber_token", "subscriber_ref"]))
+        .map(str::to_string);
+    let score: (Option<Value>, &'static str) = match subscriber_ref {
+        Some(sref) => match api.subscriber_score_details_get(&sref).await {
+            Ok(ok) => (Some(ok.data), "ok"),
+            Err(e) if e.is_capability_block() => (None, rsvp_error_code(&e)),
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, "rsvp_score", parse_retry_after(&msg));
+                (None, "unavailable")
+            }
+            Err(_) => (None, "unavailable"),
+        },
+        None => (None, "unavailable"),
+    };
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::upsert_rsvp_detail(
+            &conn,
+            rsvp_ref,
+            Some((assessment.0.as_ref(), assessment.1)),
+            Some((history.0.as_ref(), history.1)),
+            Some((score.0.as_ref(), score.1)),
+            &now,
+        )?;
+    }
+    let _ = app.emit("rsvp_detail:updated", json!({ "rsvp_ref": rsvp_ref }));
+    Ok(())
+}
+
+/// Change one RSVP's state. Called ONLY from `commands::rsvp_state_update_commit`
+/// after the write_guard token has already been validated. On `429` this does
+/// NOT retry (design D6) — it records backoff bookkeeping for future calls and
+/// propagates the error so the caller must obtain a fresh confirmation.
+pub async fn rsvp_state_update(
+    app: &AppHandle,
+    meetup_token: &str,
+    rsvp_ref: &str,
+    new_state: &str,
+    send_email: bool,
+    note: Option<&str>,
+) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.rsvp_state_update(rsvp_ref, new_state, send_email, note).await {
+        Ok(ok) => {
+            let now = iso_now();
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                // The write response may already carry the updated rsvp/client;
+                // merge it opportunistically. The authoritative settle still
+                // happens via the priority post-write refresh below (design D5).
+                let _ = db::upsert_rsvp_row(&conn, meetup_token, &ok.data, &now);
+                record_rate_locked(&conn, RSVP_WRITE_KEY, &ok.rate);
+            }
+            refresh_rsvp_after_write(app, meetup_token, std::slice::from_ref(&rsvp_ref.to_string())).await;
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, RSVP_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Bulk-change a materialized set of RSVPs. Same no-auto-retry-on-429 posture
+/// as the single update.
+pub async fn rsvp_bulk_state_update(
+    app: &AppHandle,
+    meetup_token: &str,
+    rsvp_refs: &[String],
+    new_state: &str,
+    send_email: bool,
+    note: Option<&str>,
+) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.rsvp_bulk_state_update(rsvp_refs, new_state, send_email, note).await {
+        Ok(ok) => {
+            record_rate(app, RSVP_WRITE_KEY, &ok.rate);
+            refresh_rsvp_after_write(app, meetup_token, rsvp_refs).await;
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, RSVP_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Priority post-write refresh (design D5): immediately re-read the affected
+/// RSVP (single) or re-sweep the event's list (bulk) so the cache converges on
+/// the server's authoritative state in seconds, not on the next poll. Failures
+/// here are swallowed — the UI's optimistic "pending" row simply settles later
+/// on the next explicit refresh rather than snapping immediately.
+async fn refresh_rsvp_after_write(app: &AppHandle, meetup_token: &str, rsvp_refs: &[String]) {
+    if let [only] = rsvp_refs {
+        if let Ok(Some(api)) = client(app) {
+            if let Ok(ok) = api.rsvp_get(only).await {
+                let now = iso_now();
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let _ = db::upsert_rsvp_row(&conn, meetup_token, &ok.data, &now);
+            }
+        }
+    } else {
+        let _ = fetch_rsvp_list(app, meetup_token).await;
+    }
+    let _ = app.emit(
+        "rsvp_write:settled",
+        json!({ "meetup_token": meetup_token, "rsvp_refs": rsvp_refs }),
+    );
 }

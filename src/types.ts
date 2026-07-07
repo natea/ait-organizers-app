@@ -484,3 +484,90 @@ export interface SponsorDraft {
   created_at: string;
   updated_at: string;
 }
+
+// ── RSVP screening (specs/rsvp-screening) ───────────────────────────────────
+// The app's first write feature. Reads render an attendee-management screen
+// from cache; writes go through a two-step prepare/commit confirmation gate
+// enforced in Rust (not just the confirm dialog), with an append-only audit
+// trail of every attempted mutation.
+
+export type RsvpState = "registered" | "attending" | "waitlisted" | "denied";
+
+// Raw `state` drives mutation decisions; `registrant_status*` is what the
+// registrant sees (internal `denied` reads as "waitlisted" externally — the
+// API's own semantics, not something this app invents).
+export interface RsvpRow {
+  rsvp_ref: string;
+  meetup_token: string;
+  name?: string | null;
+  email?: string | null;
+  state: string;
+  registrant_status?: string | null;
+  registrant_status_label?: string | null;
+  registrant_status_text?: string | null;
+  checked_in: boolean;
+  score?: number | null;
+  updated_at: string;
+}
+
+export interface RsvpListResult {
+  meetup_token: string;
+  rows: RsvpRow[];
+}
+
+export interface RsvpDetail {
+  rsvp_ref: string;
+  assessment?: Record<string, unknown> | null;
+  assessment_status: SourceStatus;
+  history?: { events?: RsvpHistoryEvent[]; [k: string]: unknown } | null;
+  history_status: SourceStatus;
+  score?: Record<string, unknown> | null;
+  score_status: SourceStatus;
+  updated_at: string;
+}
+
+export interface RsvpHistoryEvent {
+  event_id?: string | number;
+  changed_at?: string;
+  from_status?: string;
+  to_status?: string;
+  actor_type?: string;
+  actor_name?: string;
+  source?: string;
+  reason?: string;
+  [k: string]: unknown;
+}
+
+// Returned by `_prepare` — the summary the confirm dialog renders. `token`
+// must be echoed back unchanged to `_commit`, along with the identical
+// mutation arguments (a mismatch is rejected server-side as tampered).
+export interface ConfirmSummary {
+  token: string;
+  action: "rsvp_state_update" | "rsvp_bulk_state_update";
+  rsvp_ref?: string;
+  rsvp_refs?: string[];
+  from_state?: string | null;
+  to_state: string;
+  registrant_status_label?: string | null;
+  send_email: boolean;
+  count: number;
+}
+
+export interface WriteAuditEntry {
+  id: string;
+  created_at: string;
+  action: string;
+  targets: string[];
+  from_state?: string | null;
+  to_state?: string | null;
+  send_email: boolean;
+  confirmed: boolean;
+  outcome: string;
+  error_code?: string | null;
+  updated_at: string;
+}
+
+export interface RsvpWriteSettledEvent {
+  meetup_token: string;
+  rsvp_refs: string[];
+}

@@ -1,12 +1,22 @@
 use std::sync::atomic::Ordering;
 
+use chrono::Utc;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 
 use crate::api::ApiClient;
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, MAIN_LABEL, POPOVER_LABEL};
+use crate::write_guard::BULK_CEILING;
 use crate::{db, keychain, sync};
+
+fn iso_now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn new_id() -> String {
+    format!("{:x}{:x}", rand::random::<u64>(), rand::random::<u32>())
+}
 
 /// Validate a pasted key against auth/validate, and persist it only on success
 /// (specs/api-auth). The key is written straight to the keychain and never
@@ -60,6 +70,9 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
     state.set_api_key(None);
     {
         let conn = state.db.lock().unwrap();
+        // NOTE: `write_audit` is deliberately NOT cleared here (specs/rsvp-
+        // screening design D3) — it's a durable audit log of every mutation
+        // attempt, not a cache, and must survive sign-out.
         let _ = conn.execute_batch(
             "DELETE FROM events; DELETE FROM rsvp_summaries; DELETE FROM awaiting_payment;
              DELETE FROM performance_snapshots; DELETE FROM content_pages;
@@ -68,7 +81,8 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
              DELETE FROM survey_followup; DELETE FROM sync_state;
              DELETE FROM sponsors; DELETE FROM sponsor_search_cache;
              DELETE FROM sponsor_contacts; DELETE FROM sponsor_contacts_meta;
-             DELETE FROM sponsor_drafts; DELETE FROM sponsor_jobs;",
+             DELETE FROM sponsor_drafts; DELETE FROM sponsor_jobs;
+             DELETE FROM rsvp_rows; DELETE FROM rsvp_detail;",
         );
     }
     // Reset first-sync suppression so re-sign-in doesn't fire stale notifications.
@@ -377,4 +391,260 @@ pub fn hide_popover(app: AppHandle) -> AppResult<()> {
         let _ = pop.hide();
     }
     Ok(())
+}
+
+// ── RSVP screening (specs/rsvp-screening) — first write feature ────────────
+// Every mutation below passes through `write_guard`: `_prepare` binds a token
+// to the exact intended payload (no network call); `_commit` validates that
+// token — rejecting unknown/expired/reused/tampered ones with
+// `confirmation_required` — before `api.rs` is ever invoked. This is the
+// shared choke point attendance-checkin, speaker-review, networking-connect,
+// and media-video-kit will all reuse.
+
+const VALID_RSVP_STATES: [&str; 4] = ["registered", "attending", "waitlisted", "denied"];
+
+fn validate_state(new_state: &str) -> AppResult<()> {
+    if VALID_RSVP_STATES.contains(&new_state) {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "invalid state '{new_state}' — must be one of {VALID_RSVP_STATES:?}"
+        )))
+    }
+}
+
+/// The exact-mutation payload a confirmation token is bound to. `meetup_token`
+/// is deliberately excluded — it's bookkeeping for the audit row and the
+/// post-write refresh, not part of the mutation's identity.
+fn state_update_payload(rsvp_ref: &str, new_state: &str, send_email: bool, note: Option<&str>) -> Value {
+    json!({
+        "action": "rsvp_state_update",
+        "rsvp_ref": rsvp_ref,
+        "state": new_state,
+        "send_email": send_email,
+        "note": note,
+    })
+}
+
+fn bulk_state_update_payload(rsvp_refs: &[String], new_state: &str, send_email: bool, note: Option<&str>) -> Value {
+    let mut refs = rsvp_refs.to_vec();
+    refs.sort(); // stable regardless of UI selection order
+    json!({
+        "action": "rsvp_bulk_state_update",
+        "rsvp_refs": refs,
+        "state": new_state,
+        "send_email": send_email,
+        "note": note,
+    })
+}
+
+/// Cached attendee list for one event (fast path; no network).
+#[tauri::command]
+pub fn get_rsvp_list(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_rsvp_rows(&conn, &meetup_token)
+}
+
+/// Fetch + cache the attendee list for one event, then return it. An explicit
+/// screen-open/manual-refresh action — never the poll loop.
+#[tauri::command]
+pub async fn fetch_rsvp_list(app: AppHandle, meetup_token: String) -> AppResult<Value> {
+    sync::fetch_rsvp_list(&app, &meetup_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_rsvp_rows(&conn, &meetup_token)
+}
+
+/// Cached per-registrant detail (assessment, status history, score breakdown).
+#[tauri::command]
+pub fn get_rsvp_detail(state: State<'_, AppState>, rsvp_ref: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_rsvp_detail(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
+}
+
+/// Fetch + cache one registrant's assessment/history/score, then return it.
+#[tauri::command]
+pub async fn fetch_rsvp_detail(app: AppHandle, rsvp_ref: String) -> AppResult<Value> {
+    sync::fetch_rsvp_detail(&app, &rsvp_ref).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_rsvp_detail(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
+}
+
+/// Recent write-audit entries for one event (cache-only) — shown alongside the
+/// server-side status history so the screen surfaces both (design D3).
+#[tauri::command]
+pub fn get_write_audit(state: State<'_, AppState>, meetup_token: String, limit: Option<i64>) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_write_audit_for_event(&conn, &meetup_token, limit.unwrap_or(50))
+}
+
+/// Step 1 of the write guardrail for a single RSVP: makes NO network call.
+/// Binds a confirmation token to the exact mutation and returns a summary
+/// (from/to state, registrant-facing effect, email-send choice) for the
+/// confirm dialog.
+#[tauri::command]
+pub fn rsvp_state_update_prepare(
+    state: State<'_, AppState>,
+    rsvp_ref: String,
+    new_state: String,
+    send_email: bool,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_state(&new_state)?;
+    let conn = state.db.lock().unwrap();
+    let cached = db::get_rsvp_row(&conn, &rsvp_ref)?;
+    drop(conn);
+    let from_state = cached.as_ref().and_then(|r| r.get("state").and_then(Value::as_str)).map(str::to_string);
+    let registrant_status_label = cached.as_ref().and_then(|r| r.get("registrant_status_label").and_then(Value::as_str)).map(str::to_string);
+
+    let payload = state_update_payload(&rsvp_ref, &new_state, send_email, note.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "rsvp_state_update",
+        "rsvp_ref": rsvp_ref,
+        "from_state": from_state,
+        "to_state": new_state,
+        "registrant_status_label": registrant_status_label,
+        "send_email": send_email,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token against the identical payload — rejecting any
+/// mismatch as `confirmation_required` before this touches the network — then
+/// write the `attempted` audit row, call the API, update the audit outcome
+/// after, and (on success) run the priority post-write refresh (design D5).
+/// On `forbidden_*`/`rate_limited` the mutation is aborted with no cache
+/// change beyond the audit row (design D6/D7).
+#[tauri::command]
+pub async fn rsvp_state_update_commit(
+    app: AppHandle,
+    token: String,
+    meetup_token: String,
+    rsvp_ref: String,
+    new_state: String,
+    send_email: bool,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_state(&new_state)?;
+    let payload = state_update_payload(&rsvp_ref, &new_state, send_email, note.as_deref());
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let from_state = {
+        let conn = app_state.db.lock().unwrap();
+        db::get_rsvp_row(&conn, &rsvp_ref)?
+            .and_then(|r| r.get("state").and_then(Value::as_str).map(str::to_string))
+    };
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "rsvp_state_update", Some(&meetup_token), &[rsvp_ref.clone()],
+            from_state.as_deref(), Some(&new_state), send_email, true, &now,
+        )?;
+    }
+
+    let result = sync::rsvp_state_update(&app, &meetup_token, &rsvp_ref, &new_state, send_email, note.as_deref()).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    let conn = app_state.db.lock().unwrap();
+    Ok(db::get_rsvp_row(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
+}
+
+/// Step 1 of the write guardrail for a bulk triage. Enforces the materialized
+/// selection ceiling BEFORE a token is ever prepared (design D4) — a
+/// selection over the ceiling gets a `ceiling_exceeded` error instead, telling
+/// the caller to chunk.
+#[tauri::command]
+pub fn rsvp_bulk_state_update_prepare(
+    state: State<'_, AppState>,
+    rsvp_refs: Vec<String>,
+    new_state: String,
+    send_email: bool,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_state(&new_state)?;
+    if rsvp_refs.is_empty() {
+        return Err(AppError::Other("selection is empty".into()));
+    }
+    if rsvp_refs.len() > BULK_CEILING {
+        return Err(AppError::CeilingExceeded(format!(
+            "selection of {} exceeds the per-call ceiling of {BULK_CEILING} — split into chunks",
+            rsvp_refs.len(),
+        )));
+    }
+    let payload = bulk_state_update_payload(&rsvp_refs, &new_state, send_email, note.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "rsvp_bulk_state_update",
+        "rsvp_refs": rsvp_refs,
+        "to_state": new_state,
+        "send_email": send_email,
+        "count": rsvp_refs.len(),
+    }))
+}
+
+/// Step 2 of bulk triage: same token-validation gate, ceiling re-checked
+/// defensively, audit before/after, no auto-retry on rate limit, priority
+/// post-write refresh (re-sweeps the event's list) on success.
+#[tauri::command]
+pub async fn rsvp_bulk_state_update_commit(
+    app: AppHandle,
+    token: String,
+    meetup_token: String,
+    rsvp_refs: Vec<String>,
+    new_state: String,
+    send_email: bool,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_state(&new_state)?;
+    if rsvp_refs.len() > BULK_CEILING {
+        return Err(AppError::CeilingExceeded(format!(
+            "selection of {} exceeds the per-call ceiling of {BULK_CEILING}",
+            rsvp_refs.len(),
+        )));
+    }
+    let payload = bulk_state_update_payload(&rsvp_refs, &new_state, send_email, note.as_deref());
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "rsvp_bulk_state_update", Some(&meetup_token), &rsvp_refs,
+            None, Some(&new_state), send_email, true, &now,
+        )?;
+    }
+
+    let result = sync::rsvp_bulk_state_update(&app, &meetup_token, &rsvp_refs, &new_state, send_email, note.as_deref()).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    Ok(json!({ "updated": rsvp_refs.len() }))
 }

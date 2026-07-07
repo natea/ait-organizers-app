@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ChapterDeliverability,
+  ConfirmSummary,
   EventEmail,
   EventObj,
   EventsPayload,
@@ -13,12 +14,17 @@ import type {
   PromotionDraft,
   PromotionDraftMap,
   PromotionJobEvent,
+  RsvpDetail,
+  RsvpListResult,
+  RsvpRow,
+  RsvpWriteSettledEvent,
   SponsorContactsResult,
   SponsorDraft,
   SponsorDraftProgressEvent,
   SponsorSearchResult,
   SurveyFollowup,
   Throughput,
+  WriteAuditEntry,
 } from "./types";
 
 export function validateAndStore(key: string): Promise<Identity> {
@@ -267,4 +273,104 @@ export function getSponsorJob(jobId: string): Promise<Record<string, unknown> | 
 /** Progress events for tracked sponsor research/pitch generation jobs. */
 export function onSponsorDraftProgress(cb: (e: SponsorDraftProgressEvent) => void): Promise<UnlistenFn> {
   return listen<SponsorDraftProgressEvent>("sponsor_draft_progress", (e) => cb(e.payload));
+}
+
+// ── RSVP screening (specs/rsvp-screening) — first write feature ────────────
+// Reads render the attendee list from cache; every mutation is a two-step
+// prepare/commit pair. `_prepare` makes no network call and returns a
+// `ConfirmSummary` for the confirm dialog; `_commit` must echo back the exact
+// same arguments plus the token, or the write guardrail rejects it server-side.
+
+/** Cached attendee list for one event (fast path; no network). */
+export function getRsvpList(meetupToken: string): Promise<RsvpListResult> {
+  return invoke("get_rsvp_list", { meetupToken });
+}
+
+/** Fetch + cache the attendee list for one event, then return it. */
+export function fetchRsvpList(meetupToken: string): Promise<RsvpListResult> {
+  return invoke("fetch_rsvp_list", { meetupToken });
+}
+
+/** Cached per-registrant detail (assessment, status history, score). */
+export function getRsvpDetail(rsvpRef: string): Promise<RsvpDetail | null> {
+  return invoke("get_rsvp_detail", { rsvpRef });
+}
+
+/** Fetch + cache one registrant's assessment/history/score, then return it. */
+export function fetchRsvpDetail(rsvpRef: string): Promise<RsvpDetail | null> {
+  return invoke("fetch_rsvp_detail", { rsvpRef });
+}
+
+/** Recent write-audit entries for one event (cache-only). */
+export function getWriteAudit(meetupToken: string, limit?: number): Promise<WriteAuditEntry[]> {
+  return invoke("get_write_audit", { meetupToken, limit: limit ?? null });
+}
+
+/** Step 1: bind a confirmation token to an exact single-RSVP mutation. */
+export function rsvpStateUpdatePrepare(
+  rsvpRef: string,
+  newState: string,
+  sendEmail: boolean,
+  note?: string,
+): Promise<ConfirmSummary> {
+  return invoke("rsvp_state_update_prepare", { rsvpRef, newState, sendEmail, note: note ?? null });
+}
+
+/** Step 2: commit the confirmed single-RSVP mutation. Arguments must exactly
+ *  match what was passed to `rsvpStateUpdatePrepare`, or the token is rejected. */
+export function rsvpStateUpdateCommit(
+  token: string,
+  meetupToken: string,
+  rsvpRef: string,
+  newState: string,
+  sendEmail: boolean,
+  note?: string,
+): Promise<RsvpRow> {
+  return invoke("rsvp_state_update_commit", {
+    token,
+    meetupToken,
+    rsvpRef,
+    newState,
+    sendEmail,
+    note: note ?? null,
+  });
+}
+
+/** Step 1 for a bulk triage over a materialized selection (ceiling-enforced). */
+export function rsvpBulkStateUpdatePrepare(
+  rsvpRefs: string[],
+  newState: string,
+  sendEmail: boolean,
+  note?: string,
+): Promise<ConfirmSummary> {
+  return invoke("rsvp_bulk_state_update_prepare", { rsvpRefs, newState, sendEmail, note: note ?? null });
+}
+
+/** Step 2: commit the confirmed bulk mutation. */
+export function rsvpBulkStateUpdateCommit(
+  token: string,
+  meetupToken: string,
+  rsvpRefs: string[],
+  newState: string,
+  sendEmail: boolean,
+  note?: string,
+): Promise<{ updated: number }> {
+  return invoke("rsvp_bulk_state_update_commit", {
+    token,
+    meetupToken,
+    rsvpRefs,
+    newState,
+    sendEmail,
+    note: note ?? null,
+  });
+}
+
+/** Emitted after the priority post-write refresh settles the cache. */
+export function onRsvpWriteSettled(cb: (e: RsvpWriteSettledEvent) => void): Promise<UnlistenFn> {
+  return listen<RsvpWriteSettledEvent>("rsvp_write:settled", (e) => cb(e.payload));
+}
+
+/** Emitted after the attendee list finishes a background fetch. */
+export function onRsvpListUpdated(cb: (meetupToken: string) => void): Promise<UnlistenFn> {
+  return listen<{ meetup_token: string }>("rsvp_list:updated", (e) => cb(e.payload.meetup_token));
 }

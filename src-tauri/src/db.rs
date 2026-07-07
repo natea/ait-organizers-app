@@ -267,6 +267,65 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             error_code     TEXT,
             draft_id       TEXT
         );
+
+        -- RSVP screening (specs/rsvp-screening). One row per RSVP visible in a
+        -- cached event's attendee list. `state` is the raw internal state that
+        -- mutation decisions key off; `registrant_status*` are the
+        -- registrant-facing labels shown to the user (internal `denied` reads
+        -- as "waitlisted" externally — the API's own semantics, task 1.2).
+        CREATE TABLE IF NOT EXISTS rsvp_rows (
+            rsvp_ref                 TEXT PRIMARY KEY,
+            meetup_token             TEXT NOT NULL,
+            name                     TEXT,
+            email                    TEXT,
+            state                    TEXT NOT NULL DEFAULT 'unknown',
+            registrant_status        TEXT,
+            registrant_status_label  TEXT,
+            registrant_status_text   TEXT,
+            checked_in               INTEGER NOT NULL DEFAULT 0,
+            score                    REAL,
+            raw_json                 TEXT,
+            updated_at               TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rsvp_rows_meetup ON rsvp_rows(meetup_token);
+
+        -- Per-registrant detail: AI assessment, append-only status history, and
+        -- subscriber engagement score breakdown. Each source degrades
+        -- independently (same pattern as survey_followup) so one forbidden
+        -- endpoint never blocks the other two or the rest of the row.
+        CREATE TABLE IF NOT EXISTS rsvp_detail (
+            rsvp_ref           TEXT PRIMARY KEY,
+            assessment_json    TEXT,
+            assessment_status  TEXT NOT NULL DEFAULT 'unavailable',
+            history_json       TEXT,
+            history_status     TEXT NOT NULL DEFAULT 'unavailable',
+            score_json         TEXT,
+            score_status       TEXT NOT NULL DEFAULT 'unavailable',
+            updated_at         TEXT NOT NULL
+        );
+
+        -- Append-only write-audit trail (design D3) — the FIRST write feature
+        -- in the app's history. A row is inserted with outcome='attempted'
+        -- BEFORE the API call and updated with the real outcome after, so a
+        -- crash mid-call, a denial, or a rate limit still leaves evidence.
+        -- This table is never touched by sign-out's cache wipe (commands.rs) —
+        -- it is a durable audit log, not a cache, and must survive it.
+        CREATE TABLE IF NOT EXISTS write_audit (
+            id            TEXT PRIMARY KEY,
+            created_at    TEXT NOT NULL,
+            actor         TEXT,
+            action        TEXT NOT NULL,
+            meetup_token  TEXT,
+            targets_json  TEXT NOT NULL,
+            from_state    TEXT,
+            to_state      TEXT,
+            send_email    INTEGER NOT NULL DEFAULT 0,
+            confirmed     INTEGER NOT NULL DEFAULT 0,
+            outcome       TEXT NOT NULL DEFAULT 'attempted',
+            error_code    TEXT,
+            updated_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_write_audit_meetup ON write_audit(meetup_token);
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -1779,6 +1838,280 @@ pub fn delete_sponsor_job(conn: &Connection, id: &str) -> AppResult<()> {
     Ok(())
 }
 
+// ── RSVP screening (specs/rsvp-screening) ──────────────────────────────────
+
+/// Upsert one RSVP row from either an `rsvps/search` result item or an
+/// `rsvps/get` response — both nest the record under a top-level `rsvp`
+/// (+ `client`) object, so the same defensive extraction handles either shape
+/// (task 1.2/1.3). Returns the resolved `rsvp_ref`, or `None` if the payload
+/// carries no identifiable token.
+pub fn upsert_rsvp_row(
+    conn: &Connection,
+    meetup_token: &str,
+    row: &Value,
+    now: &str,
+) -> AppResult<Option<String>> {
+    let rsvp = row.get("rsvp").cloned().unwrap_or_else(|| row.clone());
+    let client = row.get("client").cloned().unwrap_or(Value::Null);
+
+    let Some(rsvp_ref) = pick_str(&rsvp, &["rsvp_token", "token", "rsvp_ref"])
+        .or_else(|| pick_str(row, &["rsvp_token", "token", "rsvp_ref"]))
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let name = pick_str(&client, &["name"]).or_else(|| pick_str(row, &["name"])).map(str::to_string);
+    let email = pick_str(&client, &["email"]).or_else(|| pick_str(row, &["email"])).map(str::to_string);
+    let state = pick_str(&rsvp, &["state"]).unwrap_or("unknown").to_string();
+    let registrant_status = pick_str(&rsvp, &["registrant_status"]).map(str::to_string);
+    let registrant_status_label = pick_str(&rsvp, &["registrant_status_label"]).map(str::to_string);
+    let registrant_status_text = pick_str(&rsvp, &["registrant_status_text"]).map(str::to_string);
+    let checked_in = rsvp.get("checked_in").and_then(Value::as_bool).unwrap_or(false);
+    let score = pick_num(&rsvp, &["score", "engagement_score", "user_score"])
+        .or_else(|| pick_num(&client, &["score", "engagement_score"]));
+
+    conn.execute(
+        "INSERT INTO rsvp_rows
+           (rsvp_ref, meetup_token, name, email, state, registrant_status,
+            registrant_status_label, registrant_status_text, checked_in, score, raw_json, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(rsvp_ref) DO UPDATE SET
+           meetup_token=excluded.meetup_token,
+           name=excluded.name,
+           email=excluded.email,
+           state=excluded.state,
+           registrant_status=excluded.registrant_status,
+           registrant_status_label=excluded.registrant_status_label,
+           registrant_status_text=excluded.registrant_status_text,
+           checked_in=excluded.checked_in,
+           score=excluded.score,
+           raw_json=excluded.raw_json,
+           updated_at=excluded.updated_at",
+        params![
+            rsvp_ref, meetup_token, name, email, state, registrant_status,
+            registrant_status_label, registrant_status_text, checked_in as i64,
+            score, row.to_string(), now
+        ],
+    )?;
+    Ok(Some(rsvp_ref))
+}
+
+fn rsvp_row_json(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "rsvp_ref": r.get::<_, String>(0)?,
+        "meetup_token": r.get::<_, String>(1)?,
+        "name": r.get::<_, Option<String>>(2)?,
+        "email": r.get::<_, Option<String>>(3)?,
+        "state": r.get::<_, String>(4)?,
+        "registrant_status": r.get::<_, Option<String>>(5)?,
+        "registrant_status_label": r.get::<_, Option<String>>(6)?,
+        "registrant_status_text": r.get::<_, Option<String>>(7)?,
+        "checked_in": r.get::<_, i64>(8)? != 0,
+        "score": r.get::<_, Option<f64>>(9)?,
+        "updated_at": r.get::<_, String>(10)?,
+    }))
+}
+
+const RSVP_ROW_COLS: &str = "rsvp_ref, meetup_token, name, email, state, registrant_status,
+    registrant_status_label, registrant_status_text, checked_in, score, updated_at";
+
+/// One cached RSVP row (used to look up `from_state` before a mutation, and
+/// as the post-commit re-read result).
+pub fn get_rsvp_row(conn: &Connection, rsvp_ref: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {RSVP_ROW_COLS} FROM rsvp_rows WHERE rsvp_ref = ?1");
+    let row = conn.query_row(&sql, params![rsvp_ref], rsvp_row_json).optional()?;
+    Ok(row)
+}
+
+/// The cached attendee list for one event. Free-text/status filtering happens
+/// client-side over this set (spec: "list MUST render only from cached data").
+pub fn get_rsvp_rows(conn: &Connection, meetup_token: &str) -> AppResult<Value> {
+    let sql = format!(
+        "SELECT {RSVP_ROW_COLS} FROM rsvp_rows WHERE meetup_token = ?1 ORDER BY (name IS NULL), name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![meetup_token], rsvp_row_json)?;
+    let list: Vec<Value> = rows.filter_map(Result::ok).collect();
+    Ok(json!({ "meetup_token": meetup_token, "rows": list }))
+}
+
+/// Evict rows for this event no longer returned by the latest sync sweep,
+/// scoped by `meetup_token` so refreshing one event never touches another's
+/// cached attendees (mirrors `retain_events`/`retain_send_jobs`).
+pub fn retain_rsvp_rows(conn: &Connection, meetup_token: &str, keep: &[String]) -> AppResult<()> {
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT rsvp_ref FROM rsvp_rows WHERE meetup_token = ?1")?;
+        let rows = stmt.query_map(params![meetup_token], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    for rref in existing {
+        if !keep.iter().any(|k| k == &rref) {
+            conn.execute("DELETE FROM rsvp_rows WHERE rsvp_ref = ?1", params![rref])?;
+        }
+    }
+    Ok(())
+}
+
+/// Upsert one registrant's detail sources. Each of the three is only touched
+/// when its `Some((json, status))` argument is provided, so fetching one
+/// source never clobbers a previously-fetched one (same pattern as
+/// `upsert_survey_followup`).
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_rsvp_detail(
+    conn: &Connection,
+    rsvp_ref: &str,
+    assessment: Option<(Option<&Value>, &str)>,
+    history: Option<(Option<&Value>, &str)>,
+    score: Option<(Option<&Value>, &str)>,
+    now: &str,
+) -> AppResult<()> {
+    let touch_a = assessment.is_some();
+    let (a_json, a_status) = assessment
+        .map(|(j, s)| (j.map(|v| v.to_string()), s.to_string()))
+        .unwrap_or((None, "unavailable".to_string()));
+    let touch_h = history.is_some();
+    let (h_json, h_status) = history
+        .map(|(j, s)| (j.map(|v| v.to_string()), s.to_string()))
+        .unwrap_or((None, "unavailable".to_string()));
+    let touch_s = score.is_some();
+    let (s_json, s_status) = score
+        .map(|(j, s)| (j.map(|v| v.to_string()), s.to_string()))
+        .unwrap_or((None, "unavailable".to_string()));
+
+    conn.execute(
+        "INSERT INTO rsvp_detail (rsvp_ref, assessment_json, assessment_status, history_json, history_status, score_json, score_status, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(rsvp_ref) DO UPDATE SET
+           assessment_json=CASE WHEN ?9 THEN excluded.assessment_json ELSE rsvp_detail.assessment_json END,
+           assessment_status=CASE WHEN ?9 THEN excluded.assessment_status ELSE rsvp_detail.assessment_status END,
+           history_json=CASE WHEN ?10 THEN excluded.history_json ELSE rsvp_detail.history_json END,
+           history_status=CASE WHEN ?10 THEN excluded.history_status ELSE rsvp_detail.history_status END,
+           score_json=CASE WHEN ?11 THEN excluded.score_json ELSE rsvp_detail.score_json END,
+           score_status=CASE WHEN ?11 THEN excluded.score_status ELSE rsvp_detail.score_status END,
+           updated_at=excluded.updated_at",
+        params![rsvp_ref, a_json, a_status, h_json, h_status, s_json, s_status, now, touch_a, touch_h, touch_s],
+    )?;
+    Ok(())
+}
+
+pub fn get_rsvp_detail(conn: &Connection, rsvp_ref: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT assessment_json, assessment_status, history_json, history_status, score_json, score_status, updated_at
+             FROM rsvp_detail WHERE rsvp_ref = ?1",
+            params![rsvp_ref],
+            |r| {
+                Ok(json!({
+                    "rsvp_ref": rsvp_ref,
+                    "assessment": r.get::<_, Option<String>>(0)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "assessment_status": r.get::<_, String>(1)?,
+                    "history": r.get::<_, Option<String>>(2)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "history_status": r.get::<_, String>(3)?,
+                    "score": r.get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "score_status": r.get::<_, String>(5)?,
+                    "updated_at": r.get::<_, String>(6)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+// ── Write audit trail (design D3) ───────────────────────────────────────────
+// Append-only. Never deleted by sign-out's cache wipe (commands.rs) — this is
+// the durable record of every mutation attempt, not a cache.
+
+/// Insert the `attempted` row BEFORE the API call. Returns nothing further to
+/// update by primary key; the caller already has `id`.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_write_audit(
+    conn: &Connection,
+    id: &str,
+    action: &str,
+    meetup_token: Option<&str>,
+    targets: &[String],
+    from_state: Option<&str>,
+    to_state: Option<&str>,
+    send_email: bool,
+    confirmed: bool,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO write_audit
+           (id, created_at, actor, action, meetup_token, targets_json, from_state, to_state, send_email, confirmed, outcome, error_code, updated_at)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'attempted', NULL, ?2)",
+        params![
+            id, now, action, meetup_token, json!(targets).to_string(),
+            from_state, to_state, send_email as i64, confirmed as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// Update the outcome AFTER the API call resolves (success, forbidden_*,
+/// rate_limited, network, or any other error code) — so the row always ends
+/// up reflecting what actually happened, even on a crash between the two.
+pub fn update_write_audit_outcome(
+    conn: &Connection,
+    id: &str,
+    outcome: &str,
+    error_code: Option<&str>,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE write_audit SET outcome = ?2, error_code = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, outcome, error_code, now],
+    )?;
+    Ok(())
+}
+
+fn write_audit_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let targets: Vec<String> = r
+        .get::<_, String>(3)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Ok(json!({
+        "id": r.get::<_, String>(0)?,
+        "created_at": r.get::<_, String>(1)?,
+        "action": r.get::<_, String>(2)?,
+        "targets": targets,
+        "from_state": r.get::<_, Option<String>>(4)?,
+        "to_state": r.get::<_, Option<String>>(5)?,
+        "send_email": r.get::<_, i64>(6)? != 0,
+        "confirmed": r.get::<_, i64>(7)? != 0,
+        "outcome": r.get::<_, String>(8)?,
+        "error_code": r.get::<_, Option<String>>(9)?,
+        "updated_at": r.get::<_, String>(10)?,
+    }))
+}
+
+const WRITE_AUDIT_COLS: &str = "id, created_at, action, targets_json, from_state, to_state, send_email, confirmed, outcome, error_code, updated_at";
+
+/// Recent write-audit entries for one event, newest first — the attendee
+/// screen surfaces this alongside the server-side status history (design D3).
+pub fn get_write_audit_for_event(conn: &Connection, meetup_token: &str, limit: i64) -> AppResult<Value> {
+    let sql = format!(
+        "SELECT {WRITE_AUDIT_COLS} FROM write_audit WHERE meetup_token = ?1 ORDER BY created_at DESC LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![meetup_token, limit], write_audit_row)?;
+    Ok(json!(rows.filter_map(Result::ok).collect::<Vec<_>>()))
+}
+
+/// One audit entry by id — exercised by the guardrail tests below; also
+/// available for a future direct outcome lookup by callers outside this module.
+#[allow(dead_code)]
+pub fn get_write_audit(conn: &Connection, id: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {WRITE_AUDIT_COLS} FROM write_audit WHERE id = ?1");
+    let row = conn.query_row(&sql, params![id], write_audit_row).optional()?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,5 +2574,117 @@ mod tests {
         assert_eq!(sponsor_subject_key(None, Some("Acme Robotics")), "name:acme robotics");
         // A blank sponsor_token falls back to the name form.
         assert_eq!(sponsor_subject_key(Some(""), Some("Acme")), "name:acme");
+    }
+
+    // ── RSVP screening (specs/rsvp-screening) ──────────────────────────────
+
+    #[test]
+    fn rsvp_row_round_trip_from_search_shaped_payload() {
+        let c = mem();
+        let row = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp1", "state": "waitlisted",
+                "registrant_status": "waitlisted", "registrant_status_label": "Waitlisted",
+                "registrant_status_text": "You're on the waitlist", "checked_in": false, "score": 42.5
+            },
+            "client": { "name": "Jane Smith", "email": "jane@example.com" }
+        });
+        let rref = upsert_rsvp_row(&c, "m1", &row, "t1").unwrap();
+        assert_eq!(rref.as_deref(), Some("rsvp1"));
+
+        let cached = get_rsvp_row(&c, "rsvp1").unwrap().expect("row must exist");
+        assert_eq!(cached.get("state").and_then(Value::as_str), Some("waitlisted"));
+        assert_eq!(cached.get("registrant_status_label").and_then(Value::as_str), Some("Waitlisted"));
+        assert_eq!(cached.get("name").and_then(Value::as_str), Some("Jane Smith"));
+        assert_eq!(cached.get("score").and_then(Value::as_f64), Some(42.5));
+
+        let list = get_rsvp_rows(&c, "m1").unwrap();
+        let rows = list.get("rows").and_then(Value::as_array).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn rsvp_row_missing_token_is_skipped() {
+        let c = mem();
+        let row = json!({ "rsvp": { "state": "attending" }, "client": { "name": "No Token" } });
+        assert!(upsert_rsvp_row(&c, "m1", &row, "t1").unwrap().is_none());
+    }
+
+    #[test]
+    fn rsvp_row_retention_is_event_scoped() {
+        let c = mem();
+        upsert_rsvp_row(&c, "m1", &json!({ "rsvp": { "rsvp_token": "a1", "state": "attending" } }), "t1").unwrap();
+        upsert_rsvp_row(&c, "m2", &json!({ "rsvp": { "rsvp_token": "b1", "state": "attending" } }), "t1").unwrap();
+        // A refresh of m1 that keeps nothing must not evict m2's row.
+        retain_rsvp_rows(&c, "m1", &[]).unwrap();
+        let m1_rows = get_rsvp_rows(&c, "m1").unwrap();
+        assert_eq!(m1_rows.get("rows").and_then(Value::as_array).unwrap().len(), 0);
+        let m2_rows = get_rsvp_rows(&c, "m2").unwrap();
+        assert_eq!(m2_rows.get("rows").and_then(Value::as_array).unwrap().len(), 1, "other event's row must survive");
+    }
+
+    #[test]
+    fn rsvp_detail_sources_degrade_independently() {
+        let c = mem();
+        let assessment = json!({ "summary": "Strong fit" });
+        upsert_rsvp_detail(&c, "rsvp1", Some((Some(&assessment), "ok")), None, Some((None, "forbidden_scope")), "t1").unwrap();
+        let row = get_rsvp_detail(&c, "rsvp1").unwrap().expect("row must exist");
+        assert_eq!(row.get("assessment_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row.get("history_status").and_then(Value::as_str), Some("unavailable"), "untouched source stays at its default");
+        assert_eq!(row.get("score_status").and_then(Value::as_str), Some("forbidden_scope"));
+
+        // A later fetch of only the history source must not clobber the
+        // already-fetched assessment or the still-forbidden score.
+        let history = json!({ "events": [{ "to_status": "waitlisted" }] });
+        upsert_rsvp_detail(&c, "rsvp1", None, Some((Some(&history), "ok")), None, "t2").unwrap();
+        let row2 = get_rsvp_detail(&c, "rsvp1").unwrap().unwrap();
+        assert_eq!(row2.get("assessment_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row2.get("history_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row2.get("score_status").and_then(Value::as_str), Some("forbidden_scope"), "score status must persist untouched");
+    }
+
+    #[test]
+    fn write_audit_before_and_after_success() {
+        let c = mem();
+        insert_write_audit(&c, "aud1", "rsvp_state_update", Some("m1"), &["rsvp1".to_string()], Some("waitlisted"), Some("attending"), true, true, "t1").unwrap();
+        let row = get_write_audit(&c, "aud1").unwrap().expect("row must exist");
+        assert_eq!(row.get("outcome").and_then(Value::as_str), Some("attempted"), "row must exist before the API call resolves");
+
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        let row2 = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(row2.get("outcome").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row2.get("from_state").and_then(Value::as_str), Some("waitlisted"));
+        assert_eq!(row2.get("to_state").and_then(Value::as_str), Some("attending"));
+    }
+
+    #[test]
+    fn write_audit_records_denied_and_failed_outcomes() {
+        let c = mem();
+        insert_write_audit(&c, "aud2", "rsvp_state_update", Some("m1"), &["rsvp2".to_string()], Some("registered"), Some("denied"), true, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud2", "forbidden_scope", Some("forbidden_scope"), "t2").unwrap();
+        let row = get_write_audit(&c, "aud2").unwrap().unwrap();
+        assert_eq!(row.get("outcome").and_then(Value::as_str), Some("forbidden_scope"));
+        assert_eq!(row.get("error_code").and_then(Value::as_str), Some("forbidden_scope"));
+
+        insert_write_audit(&c, "aud3", "rsvp_bulk_state_update", Some("m1"), &["rsvp3".to_string(), "rsvp4".to_string()], None, Some("attending"), false, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud3", "rate_limited", Some("rate_limited"), "t2").unwrap();
+        let row3 = get_write_audit(&c, "aud3").unwrap().unwrap();
+        assert_eq!(row3.get("outcome").and_then(Value::as_str), Some("rate_limited"));
+        let targets = row3.get("targets").and_then(Value::as_array).unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[test]
+    fn write_audit_for_event_orders_newest_first_and_is_scoped() {
+        let c = mem();
+        insert_write_audit(&c, "e1", "rsvp_state_update", Some("m1"), &["r1".to_string()], None, Some("attending"), true, true, "t1").unwrap();
+        insert_write_audit(&c, "e2", "rsvp_state_update", Some("m1"), &["r2".to_string()], None, Some("denied"), true, true, "t2").unwrap();
+        insert_write_audit(&c, "e3", "rsvp_state_update", Some("m2"), &["r3".to_string()], None, Some("attending"), true, true, "t3").unwrap();
+
+        let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "must not include the other event's audit rows");
+        assert_eq!(arr[0].get("id").and_then(Value::as_str), Some("e2"), "newest first");
+        assert_eq!(arr[1].get("id").and_then(Value::as_str), Some("e1"));
     }
 }
