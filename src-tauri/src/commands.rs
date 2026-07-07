@@ -166,6 +166,79 @@ pub async fn refresh_email(app: AppHandle, meetup_token: Option<String>) -> AppR
     }
 }
 
+// ── Promotion tools (specs/promotion-tools) ────────────────────────────────
+
+/// Kick off (or return the id of an already in-flight) generation job for one
+/// promotion action. Returns immediately; progress is reported via the
+/// `promotion:job` event (design D2). `platform` is empty for kinds that
+/// aren't per-platform (event_promo, discussion_topics).
+#[tauri::command]
+pub fn promotion_generate(
+    app: AppHandle,
+    kind: String,
+    meetup_token: String,
+    platform: Option<String>,
+    params: Value,
+) -> AppResult<String> {
+    sync::promotion_generate(&app, kind, meetup_token, platform.unwrap_or_default(), params)
+}
+
+/// Cancel an in-flight generation job; the action falls back to its last
+/// cached draft (design D5).
+#[tauri::command]
+pub fn promotion_cancel(app: AppHandle, job_id: String) -> AppResult<()> {
+    sync::promotion_cancel(&app, &job_id)
+}
+
+/// All cached promotion drafts for one event (fast path; no network).
+#[tauri::command]
+pub fn get_promotion_drafts(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_promotion_drafts(&conn, &meetup_token)
+}
+
+/// The cached draft for one `(meetup_token, kind, platform)`, if any.
+#[tauri::command]
+pub fn get_promotion_draft(
+    state: State<'_, AppState>,
+    meetup_token: String,
+    kind: String,
+    platform: Option<String>,
+) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(
+        db::get_promotion_draft(&conn, &meetup_token, &kind, platform.unwrap_or_default().as_str())?
+            .unwrap_or(Value::Null),
+    )
+}
+
+/// Current state of one job, in case the frontend missed its event.
+#[tauri::command]
+pub fn get_promotion_job(state: State<'_, AppState>, job_id: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_promotion_job(&conn, &job_id)?.unwrap_or(Value::Null))
+}
+
+/// Logo/brand asset search — a cheap GET cached with a short freshness window,
+/// not a tracked generation job (design D3).
+#[tauri::command]
+pub async fn logo_search(
+    app: AppHandle,
+    query: String,
+    scope: Option<String>,
+    include_co_branded: Option<bool>,
+    limit: Option<u32>,
+) -> AppResult<Value> {
+    sync::logo_search(
+        &app,
+        query,
+        scope.unwrap_or_else(|| "smart_match".to_string()),
+        include_co_branded.unwrap_or(false),
+        limit.unwrap_or(20),
+    )
+    .await
+}
+
 #[tauri::command]
 pub fn get_next_event(app: AppHandle) -> AppResult<Value> {
     Ok(sync::next_event_json(&app).unwrap_or(Value::Null))

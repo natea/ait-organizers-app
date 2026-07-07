@@ -31,6 +31,7 @@ import {
   statusChip,
   throughputSparkHTML,
 } from "./email";
+import { mountPromote } from "./promote";
 
 // Active-send polling cadence — the gentlest value that still feels live
 // (design D3 open question). Only runs while the panel is open AND a job is
@@ -54,6 +55,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
   let throughput = new Map<string, Throughput>();
   let surveyFollowup: SurveyFollowup | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  const promote = mountPromote("promoteSlot");
 
   function stopPolling(): void {
     if (pollTimer) {
@@ -73,6 +75,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
     const cached = await getEventDetail(meetupToken);
     if (cached) render(cached);
     else root.innerHTML = `<div class="content"><div class="empty"><div class="spinner"></div></div></div>`;
+    await promote.open(meetupToken);
 
     // Refresh scoped detail (performance + awaiting); degrade gracefully.
     let latest: EventObj | null = cached;
@@ -120,6 +123,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
     if ((cached?.kind ?? "upcoming") === "past") {
       await loadSurveyFollowup(meetupToken);
     }
+    await promote.refresh(meetupToken);
   }
 
   // Pull cached email + throughput for active jobs and repaint the panel.
@@ -184,6 +188,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
     });
     paintEmail();
     paintSurveyFollowup();
+    promote.paint();
   }
 
   // The email panel loads asynchronously from the event body, so it fills a
@@ -269,6 +274,7 @@ function bodyHTML(ev: EventObj): string {
       ${payPanel || perfPanel}
       ${payPanel ? perfPanel : ""}
       <div id="emailSlot" style="grid-column:1/-1"></div>
+      <div id="promoteSlot" style="grid-column:1/-1"></div>
       ${gallery}
       ${isPast ? `<div id="surveyFollowupSlot" style="grid-column:1/-1"></div>` : ""}
     </div>

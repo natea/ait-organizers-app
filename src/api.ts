@@ -8,7 +8,11 @@ import type {
   EventObj,
   EventsPayload,
   Identity,
+  LogoSearchResult,
   NextEvent,
+  PromotionDraft,
+  PromotionDraftMap,
+  PromotionJobEvent,
   SurveyFollowup,
   Throughput,
 } from "./types";
@@ -121,4 +125,55 @@ export function onEmailEvent(cb: (meetupToken: string) => void): Promise<Unliste
 // Emitted when the chapter deliverability surface finishes syncing.
 export function onEmailChapter(cb: () => void): Promise<UnlistenFn> {
   return listen("email:chapter", cb);
+}
+
+// ── Promotion tools (specs/promotion-tools) ────────────────────────────────
+
+/** Kick off (or, if one is already in flight, return the id of) a generation job. */
+export function promotionGenerate(
+  kind: string,
+  meetupToken: string,
+  platform: string | undefined,
+  params: Record<string, unknown>,
+): Promise<string> {
+  return invoke("promotion_generate", { kind, meetupToken, platform: platform ?? null, params });
+}
+
+/** Cancel an in-flight generation job; the action falls back to its cached draft. */
+export function promotionCancel(jobId: string): Promise<void> {
+  return invoke("promotion_cancel", { jobId });
+}
+
+/** All cached promotion drafts for one event (fast path; no network). */
+export function getPromotionDrafts(meetupToken: string): Promise<PromotionDraftMap> {
+  return invoke("get_promotion_drafts", { meetupToken });
+}
+
+/** The cached draft for one (event, kind, platform), if any. */
+export function getPromotionDraft(
+  meetupToken: string,
+  kind: string,
+  platform?: string,
+): Promise<PromotionDraft | null> {
+  return invoke("get_promotion_draft", { meetupToken, kind, platform: platform ?? null });
+}
+
+/** Logo/brand asset search — cheap GET, cached with a short freshness window. */
+export function logoSearch(
+  query: string,
+  scope?: string,
+  includeCoBranded?: boolean,
+  limit?: number,
+): Promise<LogoSearchResult> {
+  return invoke("logo_search", {
+    query,
+    scope: scope ?? null,
+    includeCoBranded: includeCoBranded ?? null,
+    limit: limit ?? null,
+  });
+}
+
+/** Progress events for tracked generation jobs (design D2). */
+export function onPromotionJob(cb: (e: PromotionJobEvent) => void): Promise<UnlistenFn> {
+  return listen<PromotionJobEvent>("promotion:job", (e) => cb(e.payload));
 }

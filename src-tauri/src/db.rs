@@ -133,6 +133,45 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             email_status  TEXT NOT NULL DEFAULT 'unavailable',
             updated_at    TEXT NOT NULL
         );
+
+        -- Promotion tools (specs/promotion-tools). Latest generated draft per
+        -- event/kind/platform (`platform` is '' for kinds that aren't
+        -- per-platform, e.g. event_promo/discussion_topics) — a regeneration
+        -- upserts only its own (meetup_token, kind, platform) row so platforms
+        -- never clobber each other (design D3).
+        CREATE TABLE IF NOT EXISTS promotion_drafts (
+            meetup_token  TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            platform      TEXT NOT NULL DEFAULT '',
+            params_json   TEXT,
+            result_json   TEXT,
+            generated_at  TEXT NOT NULL,
+            PRIMARY KEY (meetup_token, kind, platform)
+        );
+
+        -- Tracked async generation jobs (design D2). Never polled — created
+        -- only on an explicit user-initiated kickoff (promotion_generate).
+        CREATE TABLE IF NOT EXISTS promotion_jobs (
+            id            TEXT PRIMARY KEY,
+            meetup_token  TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            platform      TEXT NOT NULL DEFAULT '',
+            params_hash   TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            started_at    TEXT NOT NULL,
+            error_code    TEXT
+        );
+
+        -- Logo search results are a cheap GET, not a billed generation, so they
+        -- get a short freshness-window cache keyed by query params (design D3).
+        CREATE TABLE IF NOT EXISTS logo_search_cache (
+            query               TEXT NOT NULL,
+            scope               TEXT NOT NULL,
+            include_co_branded  INTEGER NOT NULL,
+            result_json         TEXT,
+            fetched_at          TEXT NOT NULL,
+            PRIMARY KEY (query, scope, include_co_branded)
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -1014,6 +1053,226 @@ pub fn feature_states(conn: &Connection) -> AppResult<Value> {
     Ok(Value::Object(map))
 }
 
+// ── Promotion tools (specs/promotion-tools) ────────────────────────────────
+
+/// Upsert the latest draft for one `(meetup_token, kind, platform)`. `platform`
+/// is `""` for kinds that aren't per-platform (event_promo, discussion_topics).
+pub fn upsert_promotion_draft(
+    conn: &Connection,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+    params: &Value,
+    result: &Value,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO promotion_drafts (meetup_token, kind, platform, params_json, result_json, generated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(meetup_token, kind, platform) DO UPDATE SET
+           params_json=excluded.params_json,
+           result_json=excluded.result_json,
+           generated_at=excluded.generated_at",
+        params![
+            meetup_token,
+            kind,
+            platform,
+            params.to_string(),
+            result.to_string(),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// The cached draft for one `(meetup_token, kind, platform)`, if any.
+pub fn get_promotion_draft(
+    conn: &Connection,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT params_json, result_json, generated_at FROM promotion_drafts
+             WHERE meetup_token = ?1 AND kind = ?2 AND platform = ?3",
+            params![meetup_token, kind, platform],
+            |r| {
+                Ok(json!({
+                    "params": r.get::<_, Option<String>>(0)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "result": r.get::<_, Option<String>>(1)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "generated_at": r.get::<_, String>(2)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// All cached promotion drafts for one event, keyed `"kind"` or `"kind:platform"`
+/// — lets the Promote panel paint every cached slot in a single round trip.
+pub fn get_promotion_drafts(conn: &Connection, meetup_token: &str) -> AppResult<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, platform, result_json, generated_at FROM promotion_drafts WHERE meetup_token = ?1",
+    )?;
+    let rows = stmt.query_map(params![meetup_token], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut map = serde_json::Map::new();
+    for (kind, platform, result, generated_at) in rows.filter_map(Result::ok) {
+        let key = if platform.is_empty() {
+            kind
+        } else {
+            format!("{kind}:{platform}")
+        };
+        map.insert(
+            key,
+            json!({
+                "result": result.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                "generated_at": generated_at,
+            }),
+        );
+    }
+    Ok(Value::Object(map))
+}
+
+/// Create a new job row in `pending` status (design D2). Kickoff must check
+/// `find_active_promotion_job` first — this always inserts.
+pub fn create_promotion_job(
+    conn: &Connection,
+    id: &str,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+    params_hash: &str,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO promotion_jobs (id, meetup_token, kind, platform, params_hash, status, started_at, error_code)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL)",
+        params![id, meetup_token, kind, platform, params_hash, now],
+    )?;
+    Ok(())
+}
+
+/// Move a job to a new status (`running`, `ready`, `error`, `timeout`), with an
+/// optional error code (forbidden_* / rate_limited / timeout / other).
+pub fn set_promotion_job_status(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    error_code: Option<&str>,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE promotion_jobs SET status = ?2, error_code = ?3 WHERE id = ?1",
+        params![id, status, error_code],
+    )?;
+    Ok(())
+}
+
+/// The in-flight (`pending`/`running`) job id for one action, if any — used to
+/// suppress a duplicate kickoff (design D7).
+pub fn find_active_promotion_job(
+    conn: &Connection,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+) -> AppResult<Option<String>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM promotion_jobs
+             WHERE meetup_token = ?1 AND kind = ?2 AND platform = ?3
+               AND status IN ('pending', 'running')
+             ORDER BY started_at DESC LIMIT 1",
+            params![meetup_token, kind, platform],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// One job's current state, for the frontend to poll if it missed an event.
+pub fn get_promotion_job(conn: &Connection, id: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT id, meetup_token, kind, platform, status, started_at, error_code
+             FROM promotion_jobs WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "meetup_token": r.get::<_, String>(1)?,
+                    "kind": r.get::<_, String>(2)?,
+                    "platform": r.get::<_, String>(3)?,
+                    "status": r.get::<_, String>(4)?,
+                    "started_at": r.get::<_, String>(5)?,
+                    "error_code": r.get::<_, Option<String>>(6)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Drop a job row entirely — used on cancel, so the action falls back to
+/// showing only its last cached draft (design D5).
+pub fn delete_promotion_job(conn: &Connection, id: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM promotion_jobs WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Cache a logo-search result page for its query params.
+pub fn upsert_logo_cache(
+    conn: &Connection,
+    query: &str,
+    scope: &str,
+    include_co_branded: bool,
+    result: &Value,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO logo_search_cache (query, scope, include_co_branded, result_json, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(query, scope, include_co_branded) DO UPDATE SET
+           result_json=excluded.result_json,
+           fetched_at=excluded.fetched_at",
+        params![query, scope, include_co_branded as i64, result.to_string(), now],
+    )?;
+    Ok(())
+}
+
+/// The cached logo-search result for these query params, with its fetch time
+/// so the caller can apply its own freshness window.
+pub fn get_logo_cache(
+    conn: &Connection,
+    query: &str,
+    scope: &str,
+    include_co_branded: bool,
+) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT result_json, fetched_at FROM logo_search_cache
+             WHERE query = ?1 AND scope = ?2 AND include_co_branded = ?3",
+            params![query, scope, include_co_branded as i64],
+            |r| {
+                Ok(json!({
+                    "result": r.get::<_, Option<String>>(0)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "fetched_at": r.get::<_, String>(1)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,5 +1440,130 @@ mod tests {
         assert_eq!(row2.get("survey_status").and_then(Value::as_str), Some("ok"));
         assert_eq!(row2.get("email_status").and_then(Value::as_str), Some("forbidden_scope"),
             "degradation flag for the untouched source must persist");
+    }
+
+    // ── Promotion tools (specs/promotion-tools) ────────────────────────────
+
+    #[test]
+    fn promotion_draft_upsert_and_read_round_trip() {
+        let c = mem();
+        let params = json!({ "package_type": "full_campaign", "audience": "general" });
+        let result = json!({ "artifact": { "headline": "Join us!" }, "draft_only": true });
+        upsert_promotion_draft(&c, "m1", "event_promo", "", &params, &result, "t1").unwrap();
+
+        let row = get_promotion_draft(&c, "m1", "event_promo", "").unwrap().expect("row must exist");
+        assert_eq!(row.get("generated_at").and_then(Value::as_str), Some("t1"));
+        assert_eq!(
+            row.get("result").and_then(|r| r.get("artifact")).and_then(|a| a.get("headline")).and_then(Value::as_str),
+            Some("Join us!")
+        );
+        assert_eq!(
+            row.get("params").and_then(|p| p.get("audience")).and_then(Value::as_str),
+            Some("general")
+        );
+
+        // Missing (meetup_token, kind, platform) combos must read back None.
+        assert!(get_promotion_draft(&c, "m1", "discussion_topics", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn promotion_draft_regenerating_one_platform_does_not_clobber_another() {
+        let c = mem();
+        let li_result = json!({ "artifact": { "text": "LinkedIn draft" } });
+        let x_result = json!({ "artifact": { "text": "X draft" } });
+        upsert_promotion_draft(&c, "m1", "social_post", "linkedin", &json!({}), &li_result, "t1").unwrap();
+        upsert_promotion_draft(&c, "m1", "social_post", "x", &json!({}), &x_result, "t1").unwrap();
+
+        // Regenerate only the LinkedIn draft.
+        let li_result_v2 = json!({ "artifact": { "text": "LinkedIn draft v2" } });
+        upsert_promotion_draft(&c, "m1", "social_post", "linkedin", &json!({}), &li_result_v2, "t2").unwrap();
+
+        let li = get_promotion_draft(&c, "m1", "social_post", "linkedin").unwrap().unwrap();
+        let x = get_promotion_draft(&c, "m1", "social_post", "x").unwrap().unwrap();
+        assert_eq!(
+            li.get("result").and_then(|r| r.get("artifact")).and_then(|a| a.get("text")).and_then(Value::as_str),
+            Some("LinkedIn draft v2")
+        );
+        assert_eq!(li.get("generated_at").and_then(Value::as_str), Some("t2"));
+        assert_eq!(
+            x.get("result").and_then(|r| r.get("artifact")).and_then(|a| a.get("text")).and_then(Value::as_str),
+            Some("X draft"),
+            "regenerating the LinkedIn draft must not clobber the X draft"
+        );
+        assert_eq!(x.get("generated_at").and_then(Value::as_str), Some("t1"));
+
+        // get_promotion_drafts must expose both under distinct platform-scoped keys.
+        let all = get_promotion_drafts(&c, "m1").unwrap();
+        assert!(all.get("social_post:linkedin").is_some());
+        assert!(all.get("social_post:x").is_some());
+    }
+
+    #[test]
+    fn promotion_job_status_transitions_persist() {
+        let c = mem();
+        create_promotion_job(&c, "job1", "m1", "event_promo", "", "hash1", "t1").unwrap();
+        let job = get_promotion_job(&c, "job1").unwrap().expect("job must exist");
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("pending"));
+
+        // Duplicate kickoff suppression: a pending job for the same action is
+        // found by find_active_promotion_job (design D7).
+        let active = find_active_promotion_job(&c, "m1", "event_promo", "").unwrap();
+        assert_eq!(active.as_deref(), Some("job1"));
+
+        set_promotion_job_status(&c, "job1", "running", None).unwrap();
+        let job = get_promotion_job(&c, "job1").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("running"));
+        assert!(find_active_promotion_job(&c, "m1", "event_promo", "").unwrap().is_some(),
+            "a running job must still suppress a duplicate kickoff");
+
+        set_promotion_job_status(&c, "job1", "ready", None).unwrap();
+        let job = get_promotion_job(&c, "job1").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("ready"));
+        assert!(job.get("error_code").and_then(Value::as_str).is_none());
+        // Once terminal, the action is no longer considered in-flight.
+        assert!(find_active_promotion_job(&c, "m1", "event_promo", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn promotion_job_error_and_timeout_carry_a_code() {
+        let c = mem();
+        create_promotion_job(&c, "job2", "m1", "social_post", "linkedin", "hash2", "t1").unwrap();
+        set_promotion_job_status(&c, "job2", "timeout", Some("timeout")).unwrap();
+        let job = get_promotion_job(&c, "job2").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("timeout"));
+        assert_eq!(job.get("error_code").and_then(Value::as_str), Some("timeout"));
+
+        create_promotion_job(&c, "job3", "m1", "discussion_topics", "", "hash3", "t1").unwrap();
+        set_promotion_job_status(&c, "job3", "error", Some("forbidden_api_group")).unwrap();
+        let job = get_promotion_job(&c, "job3").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("error"));
+        assert_eq!(job.get("error_code").and_then(Value::as_str), Some("forbidden_api_group"));
+    }
+
+    #[test]
+    fn promotion_job_cancel_deletes_the_row() {
+        let c = mem();
+        create_promotion_job(&c, "job4", "m1", "event_promo", "", "hash4", "t1").unwrap();
+        delete_promotion_job(&c, "job4").unwrap();
+        assert!(get_promotion_job(&c, "job4").unwrap().is_none());
+        assert!(find_active_promotion_job(&c, "m1", "event_promo", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn logo_cache_upsert_and_read_round_trip() {
+        let c = mem();
+        assert!(get_logo_cache(&c, "denver", "smart_match", false).unwrap().is_none());
+
+        let result = json!({ "matches": [{ "token": "logo1" }] });
+        upsert_logo_cache(&c, "denver", "smart_match", false, &result, "t1").unwrap();
+        let row = get_logo_cache(&c, "denver", "smart_match", false).unwrap().unwrap();
+        assert_eq!(row.get("fetched_at").and_then(Value::as_str), Some("t1"));
+        assert_eq!(
+            row.get("result").and_then(|r| r.get("matches")).and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+
+        // A different include_co_branded is a distinct cache key.
+        assert!(get_logo_cache(&c, "denver", "smart_match", true).unwrap().is_none());
     }
 }

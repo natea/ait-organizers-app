@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
@@ -23,6 +24,10 @@ pub struct AppState {
     pub notifications_enabled: AtomicBool,
     /// Guards against overlapping sync cycles (manual refresh + timer).
     pub syncing: AtomicBool,
+    /// In-flight promotion-generation tasks, keyed by job id, so
+    /// `promotion_cancel` can abort the background request (specs/promotion-tools,
+    /// design D5). Entries are removed once the task finishes or is cancelled.
+    pub promo_jobs: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -33,6 +38,7 @@ impl AppState {
             first_sync_done: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(true),
             syncing: AtomicBool::new(false),
+            promo_jobs: Mutex::new(HashMap::new()),
         }
     }
 

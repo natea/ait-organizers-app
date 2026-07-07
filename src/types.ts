@@ -330,3 +330,74 @@ export interface AppErr {
   code: string;
   message?: string;
 }
+
+// ── Promotion tools (specs/promotion-tools) ────────────────────────────────
+// Agent-backed generation drafts (social posts, event promo package,
+// discussion topics) plus logo/brand search. Generation is user-initiated,
+// runs as a tracked background job, and is cached per event/kind/platform so
+// navigating away and back renders instantly without re-spending a slow,
+// rate-limited call.
+
+export type PromotionKind = "social_post" | "event_promo" | "discussion_topics";
+
+export type PromotionJobStatus =
+  | "pending"
+  | "running"
+  | "ready"
+  | "error"
+  | "timeout"
+  | "cancelled";
+
+export interface PromotionJobEvent {
+  job_id: string;
+  meetup_token: string;
+  kind: PromotionKind;
+  platform: string;
+  status: PromotionJobStatus;
+  error_code?: string | null;
+}
+
+// `result` is the raw envelope `data` persisted verbatim — unknown/added
+// fields pass through rather than being dropped (design D3).
+export interface PromotionDraft {
+  result?: {
+    artifact?: unknown;
+    source?: unknown;
+    meetup?: unknown;
+    discussion_topics?: string[];
+    draft_only?: boolean;
+    generated_at?: string;
+    [k: string]: unknown;
+  } | null;
+  generated_at: string;
+}
+
+// Map keyed `"kind"` or `"kind:platform"` (get_promotion_drafts).
+export type PromotionDraftMap = Record<string, PromotionDraft>;
+
+export interface LogoMatch {
+  id?: string;
+  token?: string;
+  text_content?: string;
+  caption?: string;
+  imgix_url?: string;
+  padded_imgix_url?: string;
+  thumbnail_light_url?: string;
+  thumbnail_dark_url?: string;
+  metadata?: {
+    brand_name?: string;
+    is_on_dark_background?: boolean;
+    is_co_branded?: boolean;
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}
+
+export interface LogoSearchResult {
+  result?: {
+    matches?: LogoMatch[];
+    needs_disambiguation?: boolean;
+    [k: string]: unknown;
+  } | null;
+  fetched_at: string;
+}
