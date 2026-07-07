@@ -9,6 +9,7 @@ interface OverviewOpts {
   onOpenEmail: () => void;
   onOpenSponsors: () => void;
   onOpenCheckin: () => void;
+  onOpenBoards: () => void;
   onOpenSettings: () => void;
 }
 
@@ -27,6 +28,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
       <button class="refresh" id="emailNavBtn">Email health</button>
       <button class="refresh" id="sponsorsNavBtn">Sponsors</button>
       <button class="refresh" id="checkinNavBtn">Check in</button>
+      <button class="refresh" id="boardsNavBtn">Boards</button>
       <button class="refresh" id="settingsNavBtn">Settings</button>
       <button class="refresh" id="refreshBtn">Refresh</button>
     </div>
@@ -55,6 +57,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
   byId("emailNavBtn").addEventListener("click", () => opts.onOpenEmail());
   byId("sponsorsNavBtn").addEventListener("click", () => opts.onOpenSponsors());
   byId("checkinNavBtn").addEventListener("click", () => opts.onOpenCheckin());
+  byId("boardsNavBtn").addEventListener("click", () => opts.onOpenBoards());
   byId("settingsNavBtn").addEventListener("click", () => opts.onOpenSettings());
 
   refreshBtn.addEventListener("click", async () => {

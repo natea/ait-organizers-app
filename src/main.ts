@@ -10,6 +10,7 @@ import { mountSponsors, type SponsorsController } from "./screens/sponsors";
 import { mountScreening, type ScreeningController } from "./screens/screening";
 import { mountSpeakers, type SpeakersController } from "./screens/speakers";
 import { mountCheckin, type CheckinController } from "./screens/checkin";
+import { mountNetworking, type NetworkingController } from "./screens/networking";
 import { mountSettings, type SettingsController } from "./screens/settings";
 
 type ScreenId =
@@ -21,6 +22,7 @@ type ScreenId =
   | "scr-screening"
   | "scr-speakers"
   | "scr-checkin"
+  | "scr-boards"
   | "scr-settings";
 
 let overview: OverviewController | null = null;
@@ -30,6 +32,7 @@ let sponsors: SponsorsController | null = null;
 let screening: ScreeningController | null = null;
 let speakers: SpeakersController | null = null;
 let checkin: CheckinController | null = null;
+let boards: NetworkingController | null = null;
 let settings: SettingsController | null = null;
 let currentDetailToken: string | null = null;
 
@@ -57,6 +60,10 @@ function enterApp(): void {
     onOpenCheckin: () => {
       show("scr-checkin");
       void checkin?.open();
+    },
+    onOpenBoards: () => {
+      show("scr-boards");
+      void boards?.open();
     },
     onOpenSettings: () => {
       show("scr-settings");
@@ -101,6 +108,12 @@ function enterApp(): void {
     },
   });
   checkin = mountCheckin({
+    onBack: () => {
+      show("scr-overview");
+      overview?.reload();
+    },
+  });
+  boards = mountNetworking({
     onBack: () => {
       show("scr-overview");
       overview?.reload();

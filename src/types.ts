@@ -702,3 +702,74 @@ export interface SpeakerWriteSettledEvent {
   meetup_token: string;
   rsvp_ref: string;
 }
+
+// ── Networking / Connect (specs/networking-connect) ─────────────────────────
+// The app's fourth write feature. Boards/messages/threads/flagged-posts
+// render only from the SQLite cache; every mutation (post/reply, reaction
+// toggle, attachment upload, DM) goes through the same prepare/commit
+// confirmation gate as rsvp-screening, attendance-checkin, and speaker
+// review. `raw` carries whatever fields the API returned beyond what's
+// normalized here — the shape is unverifiable live, so the UI reads
+// defensively from both.
+
+export interface Board {
+  board_key: string;
+  title?: string | null;
+  is_dm: boolean;
+  unread_count?: number | null;
+  raw?: Record<string, unknown> | null;
+  updated_at: string;
+}
+
+export interface BoardMessage {
+  post_token: string;
+  board_key: string;
+  author?: string | null;
+  title?: string | null;
+  content_text?: string | null;
+  posted_at?: string | null;
+  mentioned_me: boolean;
+  needs_response: boolean;
+  raw?: Record<string, unknown> | null;
+  updated_at: string;
+}
+
+export interface Thread {
+  board_key: string;
+  root_post_token: string;
+  matched_post_token?: string | null;
+  posts: BoardMessage[] | Record<string, unknown>[];
+  truncated: boolean;
+  updated_at: string;
+}
+
+export type FlaggedReason = "mentioned_me" | "needs_response";
+
+export interface FlaggedPost {
+  post_token: string;
+  reason: FlaggedReason;
+  board_key?: string | null;
+  raw?: Record<string, unknown> | null;
+  updated_at: string;
+}
+
+/** Returned by every `*_prepare` write command in this feature — echoed back
+ *  unchanged (plus the identical mutation arguments) to the matching
+ *  `*_commit`, or the write guardrail rejects it as tampered. */
+export interface WritePreview {
+  token: string;
+  action:
+    | "message_board_post_create"
+    | "message_board_reaction_toggle"
+    | "message_board_attachment_upload"
+    | "direct_message_post_create";
+  count: number;
+  [k: string]: unknown;
+}
+
+export type ConfirmationToken = string;
+
+export interface NetworkingWriteSettledEvent {
+  board_key?: string | null;
+}
+

@@ -1066,3 +1066,429 @@ pub async fn speaker_proposal_commit(
     let conn = app_state.db.lock().unwrap();
     Ok(db::get_speaker_proposal(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
 }
+
+// ── Networking / Connect (specs/networking-connect) — reuses write_guard ───
+// The app's fourth write feature. Every mutation (post/reply, reaction
+// toggle, attachment upload, DM) passes through the same prepare/commit
+// confirmation gate as rsvp-screening, attendance-checkin, and speaker
+// review, and reuses `write_audit` — no bespoke audit path.
+
+const VALID_REACTION_TYPES: [&str; 13] = [
+    "thumbs_up", "thumbs_down", "love", "haha", "fire", "100", "trophy",
+    "pizza", "rocket", "robot", "rainbow", "salute", "gen_ai",
+];
+
+fn validate_reaction_type(t: &str) -> AppResult<()> {
+    if VALID_REACTION_TYPES.contains(&t) {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "invalid reaction_type '{t}' — must be one of {VALID_REACTION_TYPES:?}"
+        )))
+    }
+}
+
+fn validate_post_content(content: &str) -> AppResult<()> {
+    if content.trim().is_empty() {
+        return Err(AppError::Other("post content is required".into()));
+    }
+    if content.chars().count() > 10_000 {
+        return Err(AppError::Other("post content exceeds the 10000 character limit".into()));
+    }
+    Ok(())
+}
+
+/// Image-URL caps (spec: "rejects the write if more than four URLs or a URL
+/// over 2048 characters is supplied") — enforced before a token is ever
+/// prepared, so an over-cap request never even reaches `write_guard`.
+fn validate_image_urls(urls: &[String]) -> AppResult<()> {
+    if urls.len() > 4 {
+        return Err(AppError::Other(format!(
+            "{} image URLs exceeds the maximum of 4",
+            urls.len()
+        )));
+    }
+    for u in urls {
+        if u.chars().count() > 2048 {
+            return Err(AppError::Other("image URL exceeds the 2048 character limit".into()));
+        }
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err(AppError::Other("image URL must be a public http(s) URL".into()));
+        }
+    }
+    Ok(())
+}
+
+fn post_create_payload(
+    board_key: &str,
+    content: &str,
+    title: Option<&str>,
+    reply_to_post_token: Option<&str>,
+    image_urls: &[String],
+) -> Value {
+    json!({
+        "action": "message_board_post_create",
+        "board_key": board_key,
+        "content": content,
+        "title": title,
+        "reply_to_post_token": reply_to_post_token,
+        "image_urls": image_urls,
+    })
+}
+
+fn reaction_toggle_payload(board_key: &str, post_token: &str, reaction_type: &str) -> Value {
+    json!({
+        "action": "message_board_reaction_toggle",
+        "board_key": board_key,
+        "post_token": post_token,
+        "reaction_type": reaction_type,
+    })
+}
+
+fn attachment_upload_payload(board_key: &str, image_url: &str) -> Value {
+    json!({ "action": "message_board_attachment_upload", "board_key": board_key, "image_url": image_url })
+}
+
+fn direct_message_payload(client_refs: &[String], emails: &[String], content: &str) -> Value {
+    let mut refs = client_refs.to_vec();
+    refs.sort();
+    let mut ems = emails.to_vec();
+    ems.sort();
+    json!({ "action": "direct_message_post_create", "client_refs": refs, "emails": ems, "content": content })
+}
+
+/// Cached accessible boards (fast path; no network).
+#[tauri::command]
+pub fn get_networking_boards(state: State<'_, AppState>) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_boards(&conn)
+}
+
+/// Fetch + cache boards and the Attention inbox, then return the cached
+/// boards list. An explicit screen-open/manual-refresh action.
+#[tauri::command]
+pub async fn refresh_networking(app: AppHandle) -> AppResult<Value> {
+    sync::fetch_networking(&app).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_boards(&conn)
+}
+
+/// Cached messages for one board (fast path; no network).
+#[tauri::command]
+pub fn get_board_messages(state: State<'_, AppState>, board_key: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_board_messages(&conn, &board_key)
+}
+
+/// Fetch + cache one board's messages, optionally filtered by
+/// mentioned_me/needs_response, then return the cached (post-filter) view.
+#[tauri::command]
+pub async fn fetch_board_messages(
+    app: AppHandle,
+    board_key: String,
+    mentioned_me: Option<bool>,
+    needs_response: Option<bool>,
+) -> AppResult<Value> {
+    sync::fetch_board_messages(&app, &board_key, mentioned_me.unwrap_or(false), needs_response.unwrap_or(false)).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_board_messages(&conn, &board_key)
+}
+
+/// Cached thread (fast path; no network).
+#[tauri::command]
+pub fn get_thread(state: State<'_, AppState>, board_key: String, root_post_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_thread(&conn, &board_key, &root_post_token)?.unwrap_or(Value::Null))
+}
+
+/// Fetch + cache one thread (open, or the focus-based/interval refresh of an
+/// already-open thread), then return it from cache.
+#[tauri::command]
+pub async fn fetch_thread(app: AppHandle, board_key: Option<String>, post_token: String) -> AppResult<Value> {
+    sync::fetch_thread(&app, board_key.as_deref(), &post_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    // The thread may have resolved a different root_post_token than the
+    // matched post we opened with — read back whichever board this post's
+    // cached message row belongs to, defaulting to the caller's board_key.
+    let bk = board_key.unwrap_or_default();
+    Ok(db::get_thread(&conn, &bk, &post_token)?.unwrap_or(Value::Null))
+}
+
+/// Cached cross-board Attention inbox (fast path; no network). `reason`
+/// narrows to "mentioned_me" or "needs_response"; omit for both.
+#[tauri::command]
+pub fn get_flagged_posts(state: State<'_, AppState>, reason: Option<String>) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_flagged_posts(&conn, reason.as_deref())
+}
+
+/// Fetch + cache the Attention inbox, then return it from cache.
+#[tauri::command]
+pub async fn refresh_flagged_posts(app: AppHandle, reason: Option<String>) -> AppResult<Value> {
+    sync::fetch_networking_flagged(&app).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_flagged_posts(&conn, reason.as_deref())
+}
+
+/// Step 1 of the write guardrail for creating a post/reply: makes NO network
+/// call. Validates content/image-URL caps BEFORE a token is ever prepared
+/// (spec: "rejects the write if more than four URLs...").
+#[tauri::command]
+pub fn post_create_prepare(
+    state: State<'_, AppState>,
+    board_key: String,
+    content: String,
+    title: Option<String>,
+    reply_to_post_token: Option<String>,
+    image_urls: Option<Vec<String>>,
+) -> AppResult<Value> {
+    validate_post_content(&content)?;
+    let urls = image_urls.unwrap_or_default();
+    validate_image_urls(&urls)?;
+    let payload = post_create_payload(&board_key, &content, title.as_deref(), reply_to_post_token.as_deref(), &urls);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "message_board_post_create",
+        "board_key": board_key,
+        "content": content,
+        "title": title,
+        "reply_to_post_token": reply_to_post_token,
+        "image_urls": urls,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token against the identical payload, write the
+/// `attempted` audit row, call the API, update the audit outcome, and (on
+/// success) trigger the targeted re-sync (design: "Writes trigger a targeted
+/// re-sync, not a full cycle").
+#[tauri::command]
+pub async fn post_create_commit(
+    app: AppHandle,
+    token: String,
+    board_key: String,
+    content: String,
+    title: Option<String>,
+    reply_to_post_token: Option<String>,
+    image_urls: Option<Vec<String>>,
+) -> AppResult<Value> {
+    validate_post_content(&content)?;
+    let urls = image_urls.unwrap_or_default();
+    validate_image_urls(&urls)?;
+    let payload = post_create_payload(&board_key, &content, title.as_deref(), reply_to_post_token.as_deref(), &urls);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "message_board_post_create", None, &[board_key.clone()],
+            None, Some("posted"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::networking_post_create(&app, &board_key, &content, title.as_deref(), reply_to_post_token.as_deref(), &urls).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for a reaction toggle. Per design, reactions
+/// stay lightweight (single-line preview) but still flow through the same
+/// gate — no bespoke shortcut.
+#[tauri::command]
+pub fn reaction_toggle_prepare(
+    state: State<'_, AppState>,
+    board_key: String,
+    post_token: String,
+    reaction_type: String,
+) -> AppResult<Value> {
+    validate_reaction_type(&reaction_type)?;
+    let payload = reaction_toggle_payload(&board_key, &post_token, &reaction_type);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "message_board_reaction_toggle",
+        "board_key": board_key,
+        "post_token": post_token,
+        "reaction_type": reaction_type,
+        "count": 1,
+    }))
+}
+
+/// Step 2: same token-validation gate, audit before/after, targeted re-sync
+/// of the affected board on success.
+#[tauri::command]
+pub async fn reaction_toggle_commit(
+    app: AppHandle,
+    token: String,
+    board_key: String,
+    post_token: String,
+    reaction_type: String,
+) -> AppResult<Value> {
+    validate_reaction_type(&reaction_type)?;
+    let payload = reaction_toggle_payload(&board_key, &post_token, &reaction_type);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "message_board_reaction_toggle", None, &[post_token.clone()],
+            None, Some(reaction_type.as_str()), false, true, &now,
+        )?;
+    }
+
+    let result = sync::networking_reaction_toggle(&app, &board_key, &post_token, &reaction_type).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for uploading an image attachment by URL.
+#[tauri::command]
+pub fn attachment_upload_prepare(state: State<'_, AppState>, board_key: String, image_url: String) -> AppResult<Value> {
+    validate_image_urls(std::slice::from_ref(&image_url))?;
+    let payload = attachment_upload_payload(&board_key, &image_url);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "message_board_attachment_upload",
+        "board_key": board_key,
+        "image_url": image_url,
+        "count": 1,
+    }))
+}
+
+/// Step 2: same token-validation gate, audit before/after. No cache mutation
+/// on success — the returned attachment_token/image_url is meant to be passed
+/// into a subsequent `post_create_prepare`/`commit`.
+#[tauri::command]
+pub async fn attachment_upload_commit(app: AppHandle, token: String, board_key: String, image_url: String) -> AppResult<Value> {
+    validate_image_urls(std::slice::from_ref(&image_url))?;
+    let payload = attachment_upload_payload(&board_key, &image_url);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "message_board_attachment_upload", None, &[board_key.clone()],
+            None, None, false, true, &now,
+        )?;
+    }
+
+    let result = sync::networking_attachment_upload(&app, &board_key, &image_url).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}
+
+/// Step 1 of the write guardrail for a direct message. Requires at least one
+/// resolved recipient (`client_refs` or `emails`) — the prepare preview shows
+/// them so the organizer confirms exactly who receives it.
+#[tauri::command]
+pub fn direct_message_prepare(
+    state: State<'_, AppState>,
+    client_refs: Option<Vec<String>>,
+    emails: Option<Vec<String>>,
+    content: String,
+) -> AppResult<Value> {
+    let refs = client_refs.unwrap_or_default();
+    let ems = emails.unwrap_or_default();
+    if refs.is_empty() && ems.is_empty() {
+        return Err(AppError::Other("at least one recipient (client_refs or emails) is required".into()));
+    }
+    validate_post_content(&content)?;
+    let payload = direct_message_payload(&refs, &ems, &content);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "direct_message_post_create",
+        "client_refs": refs,
+        "emails": ems,
+        "content": content,
+        "count": refs.len() + ems.len(),
+    }))
+}
+
+/// Step 2: same token-validation gate, audit before/after, targeted re-sync
+/// (the affected DM board, or the boards list if the API didn't echo one back).
+#[tauri::command]
+pub async fn direct_message_commit(
+    app: AppHandle,
+    token: String,
+    client_refs: Option<Vec<String>>,
+    emails: Option<Vec<String>>,
+    content: String,
+) -> AppResult<Value> {
+    let refs = client_refs.unwrap_or_default();
+    let ems = emails.unwrap_or_default();
+    if refs.is_empty() && ems.is_empty() {
+        return Err(AppError::Other("at least one recipient (client_refs or emails) is required".into()));
+    }
+    validate_post_content(&content)?;
+    let payload = direct_message_payload(&refs, &ems, &content);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    let mut targets = refs.clone();
+    targets.extend(ems.clone());
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "direct_message_post_create", None, &targets,
+            None, Some("posted"), false, true, &now,
+        )?;
+    }
+
+    let result = sync::networking_direct_message_post(&app, &refs, &ems, &content).await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(_) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result
+}

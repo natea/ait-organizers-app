@@ -400,6 +400,65 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             reason       TEXT,
             fetched_at   TEXT NOT NULL
         );
+
+        -- Networking / Connect (specs/networking-connect). The app's fourth
+        -- write feature, reusing `write_guard` + `write_audit`. Board access is
+        -- membership/visibility-constrained server-side (`message_board_search`)
+        -- — this table only ever holds boards the API actually returned for the
+        -- caller (design: "the app never computes access itself").
+        CREATE TABLE IF NOT EXISTS networking_boards (
+            board_key      TEXT PRIMARY KEY,
+            title          TEXT,
+            is_dm          INTEGER NOT NULL DEFAULT 0,
+            unread_count   INTEGER,
+            raw_json       TEXT,
+            updated_at     TEXT NOT NULL
+        );
+
+        -- Recent messages for one board (`message_board_messages_list`), plus
+        -- any post surfaced via `message_board_post_search`/thread expansion.
+        -- `mentioned_me`/`needs_response` mirror the API's own flags — never
+        -- computed client-side (design: "mention resolution ... are server
+        -- concerns").
+        CREATE TABLE IF NOT EXISTS networking_messages (
+            post_token     TEXT PRIMARY KEY,
+            board_key      TEXT NOT NULL,
+            author         TEXT,
+            title          TEXT,
+            content_text   TEXT,
+            posted_at      TEXT,
+            mentioned_me   INTEGER NOT NULL DEFAULT 0,
+            needs_response INTEGER NOT NULL DEFAULT 0,
+            raw_json       TEXT,
+            updated_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_networking_messages_board ON networking_messages(board_key);
+
+        -- One cached thread (`message_board_thread_get`), keyed by the board
+        -- and the root post so a reply-to lookup and a fresh open share the
+        -- same row. `posts_json` is the ordered root+replies array.
+        CREATE TABLE IF NOT EXISTS networking_threads (
+            board_key           TEXT NOT NULL,
+            root_post_token     TEXT NOT NULL,
+            matched_post_token  TEXT,
+            posts_json          TEXT,
+            truncated           INTEGER NOT NULL DEFAULT 0,
+            updated_at          TEXT NOT NULL,
+            PRIMARY KEY (board_key, root_post_token)
+        );
+
+        -- Cross-board "Attention" inbox (`message_board_post_search` with
+        -- `mentioned_me=true` / `needs_response=true`), tagged by which reason
+        -- surfaced the post — a post can appear under both reasons at once
+        -- (task: "cache them tagged by reason").
+        CREATE TABLE IF NOT EXISTS networking_flagged_posts (
+            post_token   TEXT NOT NULL,
+            reason       TEXT NOT NULL,
+            board_key    TEXT,
+            raw_json     TEXT,
+            updated_at   TEXT NOT NULL,
+            PRIMARY KEY (post_token, reason)
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -2604,6 +2663,285 @@ pub fn get_speaker_candidates(conn: &Connection, scope: &str) -> AppResult<Value
     Ok(json!({ "scope": scope, "candidates": candidates, "meta": meta }))
 }
 
+// ── Networking / Connect (specs/networking-connect) ────────────────────────
+// The app's fourth write feature. Boards/messages/threads/flagged-posts are
+// cached exactly as the API returns them — the app never computes membership
+// or visibility itself (design: "trusting the API and degrading gracefully").
+// Writes (`message_board_post_create`, `message_board_reaction_toggle`,
+// `message_board_attachment_upload`, `direct_message_post_create`) reuse the
+// same write_guard prepare/commit gate and `write_audit` table as every other
+// write feature (commands.rs).
+
+fn board_key_of(v: &Value) -> Option<&str> {
+    pick_str(v, &["board_key"])
+        .or_else(|| v.get("board").and_then(|b| pick_str(b, &["board_key"])))
+        .or_else(|| v.get("refs").and_then(|r| pick_str(r, &["board_key"])))
+}
+
+fn post_token_of(v: &Value) -> Option<&str> {
+    pick_str(v, &["post_token", "token", "id"])
+}
+
+/// Upsert one board row from a `message_board_search` result. Returns the
+/// board_key on success so the caller can build a retain-keep list.
+pub fn upsert_board(conn: &Connection, board: &Value, now: &str) -> AppResult<Option<String>> {
+    let Some(key) = pick_str(board, &["board_key"]) else { return Ok(None) };
+    let title = pick_str(board, &["title", "name"]);
+    let is_dm = board
+        .get("is_direct_message")
+        .and_then(Value::as_bool)
+        .or_else(|| board.get("direct_message").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let unread = pick_num(board, &["unread_count"]);
+    conn.execute(
+        "INSERT INTO networking_boards (board_key, title, is_dm, unread_count, raw_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(board_key) DO UPDATE SET
+           title=excluded.title, is_dm=excluded.is_dm, unread_count=excluded.unread_count,
+           raw_json=excluded.raw_json, updated_at=excluded.updated_at",
+        params![key, title, is_dm as i64, unread, board.to_string(), now],
+    )?;
+    Ok(Some(key.to_string()))
+}
+
+fn board_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let raw: Option<String> = r.get(4)?;
+    Ok(json!({
+        "board_key": r.get::<_, String>(0)?,
+        "title": r.get::<_, Option<String>>(1)?,
+        "is_dm": r.get::<_, i64>(2)? != 0,
+        "unread_count": r.get::<_, Option<i64>>(3)?,
+        "raw": raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "updated_at": r.get::<_, String>(5)?,
+    }))
+}
+
+/// All cached boards, DM boards last, alphabetical within each group.
+pub fn get_boards(conn: &Connection) -> AppResult<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT board_key, title, is_dm, unread_count, raw_json, updated_at
+         FROM networking_boards ORDER BY is_dm ASC, (title IS NULL), title",
+    )?;
+    let rows = stmt.query_map([], board_row)?;
+    Ok(json!(rows.filter_map(Result::ok).collect::<Vec<_>>()))
+}
+
+/// Drop boards not present in the latest `message_board_search` sweep, and
+/// (task 3.3) drop one specific board immediately when a read for it returns
+/// `forbidden_scope` — a visibility change server-side.
+pub fn retain_boards(conn: &Connection, keep: &[String]) -> AppResult<()> {
+    let mut stmt = conn.prepare("SELECT board_key FROM networking_boards")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for key in existing {
+        if !keep.contains(&key) {
+            drop_board(conn, &key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a board and everything cached under it (messages, threads, flagged
+/// posts) — used when a read returns `forbidden_scope` (task 3.3) so a
+/// visibility change server-side doesn't leave orphaned rows behind.
+pub fn drop_board(conn: &Connection, board_key: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM networking_boards WHERE board_key = ?1", params![board_key])?;
+    conn.execute("DELETE FROM networking_messages WHERE board_key = ?1", params![board_key])?;
+    conn.execute("DELETE FROM networking_threads WHERE board_key = ?1", params![board_key])?;
+    conn.execute("DELETE FROM networking_flagged_posts WHERE board_key = ?1", params![board_key])?;
+    Ok(())
+}
+
+/// Upsert one message/post row (from `message_board_messages_list` or a
+/// thread's posts array). Returns the post_token on success.
+pub fn upsert_board_message(conn: &Connection, board_key: &str, row: &Value, now: &str) -> AppResult<Option<String>> {
+    let Some(token) = post_token_of(row) else { return Ok(None) };
+    let author = pick_str(row, &["author", "author_name", "posted_by"]);
+    let title = pick_str(row, &["title"]);
+    let content = pick_str(row, &["content_text", "content", "snippet", "body"]);
+    let posted_at = pick_str(row, &["posted_at", "created_at"]);
+    let mentioned_me = row.get("mentioned_me").and_then(Value::as_bool).unwrap_or(false);
+    let needs_response = row.get("needs_response").and_then(Value::as_bool).unwrap_or(false);
+    conn.execute(
+        "INSERT INTO networking_messages
+           (post_token, board_key, author, title, content_text, posted_at, mentioned_me, needs_response, raw_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(post_token) DO UPDATE SET
+           board_key=excluded.board_key, author=excluded.author, title=excluded.title,
+           content_text=excluded.content_text, posted_at=excluded.posted_at,
+           mentioned_me=excluded.mentioned_me, needs_response=excluded.needs_response,
+           raw_json=excluded.raw_json, updated_at=excluded.updated_at",
+        params![
+            token, board_key, author, title, content, posted_at,
+            mentioned_me as i64, needs_response as i64, row.to_string(), now
+        ],
+    )?;
+    Ok(Some(token.to_string()))
+}
+
+fn message_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let raw: Option<String> = r.get(8)?;
+    Ok(json!({
+        "post_token": r.get::<_, String>(0)?,
+        "board_key": r.get::<_, String>(1)?,
+        "author": r.get::<_, Option<String>>(2)?,
+        "title": r.get::<_, Option<String>>(3)?,
+        "content_text": r.get::<_, Option<String>>(4)?,
+        "posted_at": r.get::<_, Option<String>>(5)?,
+        "mentioned_me": r.get::<_, i64>(6)? != 0,
+        "needs_response": r.get::<_, i64>(7)? != 0,
+        "raw": raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "updated_at": r.get::<_, String>(9)?,
+    }))
+}
+
+/// Cached messages for one board, newest first.
+pub fn get_board_messages(conn: &Connection, board_key: &str) -> AppResult<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT post_token, board_key, author, title, content_text, posted_at, mentioned_me, needs_response, raw_json, updated_at
+         FROM networking_messages WHERE board_key = ?1 ORDER BY (posted_at IS NULL), posted_at DESC",
+    )?;
+    let rows = stmt.query_map(params![board_key], message_row)?;
+    Ok(json!(rows.filter_map(Result::ok).collect::<Vec<_>>()))
+}
+
+/// Drop cached messages for a board that a fresh unfiltered fetch no longer
+/// returned (task 3.2) — only called after a full (unfiltered) fetch so a
+/// filtered mentions/needs-response fetch never prunes the rest of the board.
+pub fn retain_board_messages(conn: &Connection, board_key: &str, keep: &[String]) -> AppResult<()> {
+    let mut stmt = conn.prepare("SELECT post_token FROM networking_messages WHERE board_key = ?1")?;
+    let existing: Vec<String> = stmt
+        .query_map(params![board_key], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for token in existing {
+        if !keep.contains(&token) {
+            conn.execute("DELETE FROM networking_messages WHERE post_token = ?1", params![token])?;
+        }
+    }
+    Ok(())
+}
+
+/// Upsert one thread (`message_board_thread_get`) — root post token, matched
+/// post, ordered posts, and truncation flag.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_thread(
+    conn: &Connection,
+    board_key: &str,
+    root_post_token: &str,
+    matched_post_token: Option<&str>,
+    posts: &[Value],
+    truncated: bool,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO networking_threads (board_key, root_post_token, matched_post_token, posts_json, truncated, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(board_key, root_post_token) DO UPDATE SET
+           matched_post_token=excluded.matched_post_token, posts_json=excluded.posts_json,
+           truncated=excluded.truncated, updated_at=excluded.updated_at",
+        params![board_key, root_post_token, matched_post_token, json!(posts).to_string(), truncated as i64, now],
+    )?;
+    // Every post in the thread is also a message row, so the board's message
+    // list and an opened thread agree on content (task 3.2).
+    for post in posts {
+        let _ = upsert_board_message(conn, board_key, post, now);
+    }
+    Ok(())
+}
+
+/// The cached thread for one (board, root post), if any.
+pub fn get_thread(conn: &Connection, board_key: &str, root_post_token: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT matched_post_token, posts_json, truncated, updated_at
+             FROM networking_threads WHERE board_key = ?1 AND root_post_token = ?2",
+            params![board_key, root_post_token],
+            |r| {
+                let posts_json: Option<String> = r.get(1)?;
+                Ok(json!({
+                    "board_key": board_key,
+                    "root_post_token": root_post_token,
+                    "matched_post_token": r.get::<_, Option<String>>(0)?,
+                    "posts": posts_json.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!([])),
+                    "truncated": r.get::<_, i64>(2)? != 0,
+                    "updated_at": r.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upsert one flagged post (mention or needs-response), tagged by `reason`.
+pub fn upsert_flagged_post(conn: &Connection, reason: &str, board_key: Option<&str>, row: &Value, now: &str) -> AppResult<Option<String>> {
+    let Some(token) = post_token_of(row) else { return Ok(None) };
+    let bk = board_key.map(str::to_string).or_else(|| board_key_of(row).map(str::to_string));
+    conn.execute(
+        "INSERT INTO networking_flagged_posts (post_token, reason, board_key, raw_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(post_token, reason) DO UPDATE SET
+           board_key=excluded.board_key, raw_json=excluded.raw_json, updated_at=excluded.updated_at",
+        params![token, reason, bk, row.to_string(), now],
+    )?;
+    Ok(Some(token.to_string()))
+}
+
+fn flagged_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let raw: Option<String> = r.get(3)?;
+    Ok(json!({
+        "post_token": r.get::<_, String>(0)?,
+        "reason": r.get::<_, String>(1)?,
+        "board_key": r.get::<_, Option<String>>(2)?,
+        "raw": raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "updated_at": r.get::<_, String>(4)?,
+    }))
+}
+
+/// Cached "Attention" inbox — all flagged posts, optionally narrowed to one
+/// reason, newest first.
+pub fn get_flagged_posts(conn: &Connection, reason: Option<&str>) -> AppResult<Value> {
+    let (sql, need_reason) = match reason {
+        Some(_) => (
+            "SELECT post_token, reason, board_key, raw_json, updated_at FROM networking_flagged_posts WHERE reason = ?1 ORDER BY updated_at DESC",
+            true,
+        ),
+        None => (
+            "SELECT post_token, reason, board_key, raw_json, updated_at FROM networking_flagged_posts ORDER BY updated_at DESC",
+            false,
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if need_reason {
+        stmt.query_map(params![reason.unwrap()], flagged_row)?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+    } else {
+        stmt.query_map([], flagged_row)?.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    Ok(json!(rows))
+}
+
+/// Drop flagged posts for one reason that a fresh sweep no longer returned.
+pub fn retain_flagged_posts(conn: &Connection, reason: &str, keep: &[String]) -> AppResult<()> {
+    let mut stmt = conn.prepare("SELECT post_token FROM networking_flagged_posts WHERE reason = ?1")?;
+    let existing: Vec<String> = stmt
+        .query_map(params![reason], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
+    for token in existing {
+        if !keep.contains(&token) {
+            conn.execute(
+                "DELETE FROM networking_flagged_posts WHERE post_token = ?1 AND reason = ?2",
+                params![token, reason],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3510,5 +3848,142 @@ mod tests {
         assert_eq!(row.get("send_email").and_then(Value::as_bool), Some(false), "send_speaker_email/send_rsvp_email are always pinned false");
         let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
+    }
+
+    // ── Networking / Connect (specs/networking-connect) ────────────────────
+
+    #[test]
+    fn board_cache_round_trip_and_retain_drops_stale_boards() {
+        let c = mem();
+        upsert_board(&c, &json!({ "board_key": "b1", "title": "General", "unread_count": 2 }), "t1").unwrap();
+        upsert_board(&c, &json!({ "board_key": "b2", "title": "Announcements" }), "t1").unwrap();
+
+        let boards = get_boards(&c).unwrap();
+        let rows = boards.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // A fresh sweep that only returns b1 must drop b2.
+        retain_boards(&c, &["b1".to_string()]).unwrap();
+        let boards2 = get_boards(&c).unwrap();
+        let rows2 = boards2.as_array().unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].get("board_key").and_then(Value::as_str), Some("b1"));
+    }
+
+    #[test]
+    fn drop_board_removes_messages_threads_and_flagged_posts() {
+        // "A board becomes forbidden on read" (spec scenario): forbidden_scope
+        // on a cached board must remove it AND everything cached under it.
+        let c = mem();
+        upsert_board(&c, &json!({ "board_key": "b1", "title": "General" }), "t1").unwrap();
+        upsert_board_message(&c, "b1", &json!({ "post_token": "p1", "content_text": "hi" }), "t1").unwrap();
+        upsert_thread(&c, "b1", "p1", Some("p1"), &[json!({ "post_token": "p1", "content_text": "hi" })], false, "t1").unwrap();
+        upsert_flagged_post(&c, "mentioned_me", Some("b1"), &json!({ "post_token": "p1" }), "t1").unwrap();
+
+        drop_board(&c, "b1").unwrap();
+
+        assert!(get_boards(&c).unwrap().as_array().unwrap().is_empty());
+        assert!(get_board_messages(&c, "b1").unwrap().as_array().unwrap().is_empty());
+        assert!(get_thread(&c, "b1", "p1").unwrap().is_none());
+        assert!(get_flagged_posts(&c, Some("mentioned_me")).unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn thread_cache_round_trip_orders_root_then_replies() {
+        let c = mem();
+        let posts = vec![
+            json!({ "post_token": "root1", "content_text": "root", "author": "Diego" }),
+            json!({ "post_token": "reply1", "content_text": "reply one", "author": "Ashley" }),
+        ];
+        upsert_thread(&c, "b1", "root1", Some("root1"), &posts, false, "t1").unwrap();
+
+        let thread = get_thread(&c, "b1", "root1").unwrap().expect("thread must be cached");
+        let cached_posts = thread.get("posts").and_then(Value::as_array).unwrap();
+        assert_eq!(cached_posts.len(), 2);
+        assert_eq!(cached_posts[0].get("post_token").and_then(Value::as_str), Some("root1"));
+        assert_eq!(cached_posts[1].get("post_token").and_then(Value::as_str), Some("reply1"));
+
+        // Every post in a fetched thread is also indexed as a board message.
+        let messages = get_board_messages(&c, "b1").unwrap();
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_reply_committed_after_write_is_appended_to_the_cached_thread() {
+        // "Reply targets an existing post": simulate the post-write targeted
+        // re-sync appending a newly-created reply to the already-cached thread.
+        let c = mem();
+        let root = json!({ "post_token": "root1", "content_text": "root" });
+        upsert_thread(&c, "b1", "root1", Some("root1"), &[root], false, "t1").unwrap();
+
+        let reply = json!({ "post_token": "reply1", "content_text": "new reply", "parent_post_token": "root1" });
+        upsert_thread(&c, "b1", "root1", Some("root1"), &[
+            json!({ "post_token": "root1", "content_text": "root" }),
+            reply,
+        ], false, "t2").unwrap();
+
+        let thread = get_thread(&c, "b1", "root1").unwrap().unwrap();
+        let posts = thread.get("posts").and_then(Value::as_array).unwrap();
+        assert_eq!(posts.len(), 2, "the reply must be appended to the cached thread after commit");
+        assert_eq!(posts[1].get("post_token").and_then(Value::as_str), Some("reply1"));
+    }
+
+    #[test]
+    fn flagged_posts_are_tagged_by_reason_and_a_post_can_carry_both() {
+        let c = mem();
+        let post = json!({ "post_token": "p1", "content_text": "@you check this" });
+        upsert_flagged_post(&c, "mentioned_me", Some("b1"), &post, "t1").unwrap();
+        upsert_flagged_post(&c, "needs_response", Some("b1"), &post, "t1").unwrap();
+
+        let mentions = get_flagged_posts(&c, Some("mentioned_me")).unwrap();
+        assert_eq!(mentions.as_array().unwrap().len(), 1);
+        let needs_response = get_flagged_posts(&c, Some("needs_response")).unwrap();
+        assert_eq!(needs_response.as_array().unwrap().len(), 1);
+        let all = get_flagged_posts(&c, None).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2, "one post cached under two reasons is two rows, one per reason");
+    }
+
+    #[test]
+    fn retain_flagged_posts_drops_stale_entries_for_that_reason_only() {
+        let c = mem();
+        upsert_flagged_post(&c, "mentioned_me", Some("b1"), &json!({ "post_token": "p1" }), "t1").unwrap();
+        upsert_flagged_post(&c, "mentioned_me", Some("b1"), &json!({ "post_token": "p2" }), "t1").unwrap();
+        upsert_flagged_post(&c, "needs_response", Some("b1"), &json!({ "post_token": "p1" }), "t1").unwrap();
+
+        retain_flagged_posts(&c, "mentioned_me", &["p1".to_string()]).unwrap();
+
+        let mentions = get_flagged_posts(&c, Some("mentioned_me")).unwrap();
+        assert_eq!(mentions.as_array().unwrap().len(), 1);
+        // needs_response reason is untouched by pruning the mentioned_me reason.
+        let needs_response = get_flagged_posts(&c, Some("needs_response")).unwrap();
+        assert_eq!(needs_response.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reaction_toggle_write_audit_reuses_the_shared_table() {
+        // Reactions flow through the same write_guard + write_audit as every
+        // other write feature — no bespoke audit path for this "lightweight"
+        // confirmation (design: "still flow through prepare/commit").
+        let c = mem();
+        insert_write_audit(&c, "aud1", "message_board_reaction_toggle", None, &["p1".to_string()], None, Some("fire"), false, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        let row = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(row.get("action").and_then(Value::as_str), Some("message_board_reaction_toggle"));
+        assert_eq!(row.get("outcome").and_then(Value::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn posted_reply_and_dm_write_audit_are_reused_and_distinct_actions() {
+        let c = mem();
+        insert_write_audit(&c, "aud1", "message_board_post_create", None, &["b1".to_string()], None, Some("posted"), false, true, "t1").unwrap();
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        insert_write_audit(&c, "aud2", "direct_message_post_create", None, &["diego@example.com".to_string()], None, Some("posted"), false, true, "t3").unwrap();
+        update_write_audit_outcome(&c, "aud2", "forbidden_scope", Some("forbidden_scope"), "t4").unwrap();
+
+        let post_row = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(post_row.get("action").and_then(Value::as_str), Some("message_board_post_create"));
+        let dm_row = get_write_audit(&c, "aud2").unwrap().unwrap();
+        assert_eq!(dm_row.get("action").and_then(Value::as_str), Some("direct_message_post_create"));
+        assert_eq!(dm_row.get("outcome").and_then(Value::as_str), Some("forbidden_scope"));
     }
 }
