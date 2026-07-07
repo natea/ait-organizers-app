@@ -494,6 +494,96 @@ impl ApiClient {
         body = cap_pitch_context_size(body, PITCH_CONTEXT_CAP_BYTES);
         self.call_gen("sponsors/pitch_generate", body).await
     }
+
+    // ── RSVP screening (specs/rsvp-screening) ──────────────────────────────
+    // Reads render the attendee-management screen from cache. `rsvp_state_update`
+    // and `rsvp_bulk_state_update` are the ONLY mutation calls in this client
+    // (design D1) — every command that reaches them first passes the
+    // prepare/commit confirmation gate in `write_guard` (commands.rs).
+
+    /// Search RSVPs for one event, optionally narrowed by `status` (raw
+    /// `rsvp.state`, e.g. "denied") or free-text `query`. Capped at 25 per call
+    /// (docs/agents-api.md rate table) — the attendee list is built from a
+    /// handful of these calls, not one exhaustive fetch.
+    pub async fn rsvp_search(
+        &self,
+        meetup_token: &str,
+        status: Option<&str>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({ "meetup_token": meetup_token, "limit": limit });
+        if let Some(s) = status {
+            body["status"] = json!(s);
+        }
+        if let Some(q) = query {
+            body["query"] = json!(q);
+        }
+        self.call("rsvps/search", body).await
+    }
+
+    /// Full RSVP detail (client + meetup context) by token — used for the
+    /// priority post-write refresh (design D5) and any direct single-row lookup.
+    pub async fn rsvp_get(&self, rsvp_ref: &str) -> AppResult<ApiOk> {
+        self.call("rsvps/get", json!({ "rsvp_ref": rsvp_ref })).await
+    }
+
+    /// AI screening assessment for one RSVP.
+    pub async fn rsvp_assessment_get(&self, rsvp_ref: &str) -> AppResult<ApiOk> {
+        self.call("rsvps/assessment", json!({ "rsvp_ref": rsvp_ref })).await
+    }
+
+    /// Append-only status-change history for one RSVP, newest first.
+    pub async fn rsvp_status_history_list(&self, rsvp_ref: &str, limit: u32) -> AppResult<ApiOk> {
+        self.call(
+            "rsvps/status_history",
+            json!({ "rsvp_token": rsvp_ref, "limit": limit }),
+        )
+        .await
+    }
+
+    /// Subscriber engagement-score breakdown, by subscriber token.
+    pub async fn subscriber_score_details_get(&self, subscriber_ref: &str) -> AppResult<ApiOk> {
+        self.call(
+            "subscribers/score_details",
+            json!({ "subscriber_ref": subscriber_ref }),
+        )
+        .await
+    }
+
+    /// Change one RSVP's state. `send_email` (default true upstream) is always
+    /// sent explicitly here — the confirm dialog surfaces it, never hides it
+    /// (spec: "Email-send choice is explicit").
+    pub async fn rsvp_state_update(
+        &self,
+        rsvp_ref: &str,
+        state: &str,
+        send_email: bool,
+        note: Option<&str>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({ "rsvp_ref": rsvp_ref, "state": state, "send_email": send_email });
+        if let Some(n) = note {
+            body["note"] = json!(n);
+        }
+        self.call("rsvps/state_update", body).await
+    }
+
+    /// Bulk-change a materialized, enumerated set of RSVPs. The caller
+    /// (commands.rs) enforces the per-call ceiling (design D4) before this is
+    /// ever reached — the permissive upstream schema never sees an unbounded body.
+    pub async fn rsvp_bulk_state_update(
+        &self,
+        rsvp_refs: &[String],
+        state: &str,
+        send_email: bool,
+        note: Option<&str>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({ "rsvp_refs": rsvp_refs, "state": state, "send_email": send_email });
+        if let Some(n) = note {
+            body["note"] = json!(n);
+        }
+        self.call("rsvps/bulk_state_update", body).await
+    }
 }
 
 /// Hard cap on the serialized `context` payload for `sponsor_pitch_generate`

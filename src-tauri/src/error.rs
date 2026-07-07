@@ -20,6 +20,15 @@ pub enum AppError {
     RateLimited(String),
     #[error("{0}")]
     NotFound(String),
+    /// The write guardrail rejected a mutation: no token, an unknown/expired/
+    /// already-consumed token, or a token whose payload doesn't match the
+    /// exact mutation requested (specs/rsvp-screening, design D2).
+    #[error("{0}")]
+    ConfirmationRequired(String),
+    /// A bulk mutation's materialized selection exceeds the per-call ceiling
+    /// (design D4) — the caller must split it into confirmed chunks.
+    #[error("{0}")]
+    CeilingExceeded(String),
     /// Client-side request timeout (generation calls only — specs/promotion-tools D5).
     #[error("{0}")]
     Timeout(String),
@@ -43,6 +52,8 @@ impl AppError {
             "rate_limited" => AppError::RateLimited(message),
             "not_found" => AppError::NotFound(message),
             "unauthorized" | "invalid_api_key" => AppError::Unauthorized(message),
+            "confirmation_required" => AppError::ConfirmationRequired(message),
+            "ceiling_exceeded" => AppError::CeilingExceeded(message),
             _ => AppError::Other(format!("{code}: {message}")),
         }
     }
@@ -58,6 +69,8 @@ impl AppError {
             AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
             AppError::RateLimited(_) => "rate_limited",
             AppError::NotFound(_) => "not_found",
+            AppError::ConfirmationRequired(_) => "confirmation_required",
+            AppError::CeilingExceeded(_) => "ceiling_exceeded",
             AppError::Timeout(_) => "timeout",
             AppError::Network(_) => "network",
             AppError::Keychain(_) => "keychain",

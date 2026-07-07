@@ -40,6 +40,7 @@ const ACTIVE_POLL_MS = 60_000;
 
 interface DetailOpts {
   onBack: () => void;
+  onOpenScreening: (meetupToken: string, eventName: string) => void;
 }
 
 export interface DetailController {
@@ -186,6 +187,9 @@ export function mountDetail(opts: DetailOpts): DetailController {
       stopPolling();
       opts.onBack();
     });
+    document.getElementById("screenAttendeesBtn")?.addEventListener("click", () => {
+      opts.onOpenScreening(ev.meetup_token, ev.event_name);
+    });
     paintEmail();
     paintSurveyFollowup();
     promote.paint();
@@ -266,7 +270,10 @@ function bodyHTML(ev: EventObj): string {
         <h2>${esc(ev.event_name)}</h2>
         <div class="d-meta">${esc(ev.city ?? "")}${org}${url}</div>
       </div>
-      ${chip}
+      <div class="d-head-actions">
+        <button class="btn-ghost" id="screenAttendeesBtn">Screen attendees</button>
+        ${chip}
+      </div>
     </div>
     <div class="d-grid">
       ${pagePanel}
