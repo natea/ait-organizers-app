@@ -65,7 +65,7 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
              DELETE FROM performance_snapshots; DELETE FROM content_pages;
              DELETE FROM email_send_jobs; DELETE FROM email_event_summary;
              DELETE FROM email_throughput; DELETE FROM email_deliverability;
-             DELETE FROM sync_state;",
+             DELETE FROM survey_followup; DELETE FROM sync_state;",
         );
     }
     // Reset first-sync suppression so re-sign-in doesn't fire stale notifications.
@@ -108,6 +108,27 @@ pub async fn refresh_now(app: AppHandle) -> AppResult<()> {
     let up = sync::run_cycle(app.clone(), true).await;
     let _ = sync::run_past(app).await;
     up
+}
+
+// ── Survey + follow-up (specs/survey-followup) ─────────────────────────────
+
+/// Cached survey + follow-up row for one event (fast path; no network).
+#[tauri::command]
+pub fn get_survey_followup(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_survey_followup(&conn, &meetup_token)?.unwrap_or(Value::Null))
+}
+
+/// Fetch survey diagnostic/report + follow-up campaign performance for one
+/// past event, then return the merged cached row. Called on detail open and
+/// manual refresh only (never the upcoming poll — sync::fetch_survey_followup
+/// itself no-ops for non-past events).
+#[tauri::command]
+pub async fn fetch_survey_followup(app: AppHandle, meetup_token: String) -> AppResult<Value> {
+    sync::fetch_survey_followup(&app, &meetup_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_survey_followup(&conn, &meetup_token)?.unwrap_or(Value::Null))
 }
 
 // ── Email lifecycle (specs/email-lifecycle) ────────────────────────────────

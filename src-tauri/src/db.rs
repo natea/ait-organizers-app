@@ -120,6 +120,19 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             reason        TEXT,
             updated_at    TEXT NOT NULL
         );
+
+        -- Post-event survey + follow-up email engagement (specs/survey-followup).
+        -- One row per meetup_token; per-source status lets the panel degrade the
+        -- survey and email sub-sections independently. Only populated for past
+        -- events, fetched on detail-open/manual-refresh — never the upcoming poll.
+        CREATE TABLE IF NOT EXISTS survey_followup (
+            meetup_token  TEXT PRIMARY KEY,
+            survey_json   TEXT,
+            survey_status TEXT NOT NULL DEFAULT 'unavailable',
+            email_json    TEXT,
+            email_status  TEXT NOT NULL DEFAULT 'unavailable',
+            updated_at    TEXT NOT NULL
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -447,7 +460,7 @@ pub fn upsert_content_page(
 // ── Email lifecycle cache (specs/email-lifecycle) ──────────────────────────
 
 /// Read a numeric field tolerating several fallback names and string encodings.
-fn pick_num(v: &Value, names: &[&str]) -> Option<f64> {
+pub(crate) fn pick_num(v: &Value, names: &[&str]) -> Option<f64> {
     for n in names {
         if let Some(x) = v.get(n) {
             if let Some(f) = x.as_f64() {
@@ -463,7 +476,7 @@ fn pick_num(v: &Value, names: &[&str]) -> Option<f64> {
     None
 }
 
-fn pick_str<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
+pub(crate) fn pick_str<'a>(v: &'a Value, names: &[&str]) -> Option<&'a str> {
     names.iter().find_map(|n| v.get(n).and_then(Value::as_str))
 }
 
@@ -852,6 +865,76 @@ pub fn get_chapter_deliverability(conn: &Connection) -> AppResult<Value> {
     Ok(out)
 }
 
+// ── Survey + follow-up cache (specs/survey-followup) ───────────────────────
+
+/// Upsert one or both sources for a `survey_followup` row. Each source is only
+/// touched when its `Some((json, status))` argument is provided, so refreshing
+/// one source (e.g. the survey diagnostic) never clobbers the other (e.g. the
+/// campaign-performance engagement) — callers pass `None` for the source they
+/// didn't fetch this cycle.
+pub fn upsert_survey_followup(
+    conn: &Connection,
+    meetup_token: &str,
+    survey_update: Option<(Option<&Value>, &str)>,
+    email_update: Option<(Option<&Value>, &str)>,
+    now: &str,
+) -> AppResult<()> {
+    let touch_survey = survey_update.is_some();
+    let (survey_json, survey_status) = survey_update
+        .map(|(j, s)| (j.map(|v| v.to_string()), s.to_string()))
+        .unwrap_or((None, "unavailable".to_string()));
+    let touch_email = email_update.is_some();
+    let (email_json, email_status) = email_update
+        .map(|(j, s)| (j.map(|v| v.to_string()), s.to_string()))
+        .unwrap_or((None, "unavailable".to_string()));
+
+    conn.execute(
+        "INSERT INTO survey_followup (meetup_token, survey_json, survey_status, email_json, email_status, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(meetup_token) DO UPDATE SET
+           survey_json=CASE WHEN ?7 THEN excluded.survey_json ELSE survey_followup.survey_json END,
+           survey_status=CASE WHEN ?7 THEN excluded.survey_status ELSE survey_followup.survey_status END,
+           email_json=CASE WHEN ?8 THEN excluded.email_json ELSE survey_followup.email_json END,
+           email_status=CASE WHEN ?8 THEN excluded.email_status ELSE survey_followup.email_status END,
+           updated_at=excluded.updated_at",
+        params![
+            meetup_token,
+            survey_json,
+            survey_status,
+            email_json,
+            email_status,
+            now,
+            touch_survey,
+            touch_email
+        ],
+    )?;
+    Ok(())
+}
+
+/// Cached survey + follow-up row for one event, or `None` if never fetched.
+pub fn get_survey_followup(conn: &Connection, meetup_token: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT survey_json, survey_status, email_json, email_status, updated_at
+             FROM survey_followup WHERE meetup_token = ?1",
+            params![meetup_token],
+            |r| {
+                Ok(json!({
+                    "meetup_token": meetup_token,
+                    "survey": r.get::<_, Option<String>>(0)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "survey_status": r.get::<_, String>(1)?,
+                    "email": r.get::<_, Option<String>>(2)?
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+                    "email_status": r.get::<_, String>(3)?,
+                    "updated_at": r.get::<_, Option<String>>(4)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
 pub fn set_sync_state(
     conn: &Connection,
     key: &str,
@@ -1011,5 +1094,92 @@ mod tests {
             .map(|e| e.get("kind").and_then(Value::as_str).unwrap_or("").to_string())
             .collect();
         assert_eq!(kinds, vec!["upcoming".to_string()], "upcoming must survive a past retain");
+    }
+
+    #[test]
+    fn survey_followup_missing_row_returns_none() {
+        let c = mem();
+        assert!(get_survey_followup(&c, "m1").unwrap().is_none());
+    }
+
+    #[test]
+    fn survey_followup_upsert_and_read_round_trip() {
+        let c = mem();
+        let survey = json!({ "response_count": 12, "eligible_attendees": 40, "response_rate": 0.3 });
+        let email = json!({ "sends": 40, "opens": 18, "open_rate": 0.45 });
+        upsert_survey_followup(
+            &c,
+            "m1",
+            Some((Some(&survey), "ok")),
+            Some((Some(&email), "ok")),
+            "t1",
+        )
+        .unwrap();
+
+        let row = get_survey_followup(&c, "m1").unwrap().expect("row must exist");
+        assert_eq!(row.get("survey_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row.get("email_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            row.get("survey").and_then(|s| s.get("response_count")).and_then(Value::as_i64),
+            Some(12)
+        );
+        assert_eq!(
+            row.get("email").and_then(|e| e.get("opens")).and_then(Value::as_i64),
+            Some(18)
+        );
+        assert_eq!(row.get("updated_at").and_then(Value::as_str), Some("t1"));
+    }
+
+    #[test]
+    fn survey_followup_refreshing_one_source_does_not_clobber_the_other() {
+        let c = mem();
+        let survey = json!({ "response_count": 5 });
+        // First cycle: only the survey source was fetched.
+        upsert_survey_followup(&c, "m1", Some((Some(&survey), "ok")), None, "t1").unwrap();
+        // Second cycle: only the email source was fetched (e.g. survey already cached).
+        let email = json!({ "sends": 20, "opens": 9 });
+        upsert_survey_followup(&c, "m1", None, Some((Some(&email), "ok")), "t2").unwrap();
+
+        let row = get_survey_followup(&c, "m1").unwrap().expect("row must exist");
+        // The survey data from cycle 1 must still be present after cycle 2 only
+        // touched the email source, and vice versa.
+        assert_eq!(
+            row.get("survey").and_then(|s| s.get("response_count")).and_then(Value::as_i64),
+            Some(5),
+            "email-only refresh must not clobber the survey source"
+        );
+        assert_eq!(row.get("survey_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            row.get("email").and_then(|e| e.get("sends")).and_then(Value::as_i64),
+            Some(20)
+        );
+        assert_eq!(row.get("email_status").and_then(Value::as_str), Some("ok"));
+    }
+
+    #[test]
+    fn survey_followup_degradation_flags_persist() {
+        let c = mem();
+        upsert_survey_followup(
+            &c,
+            "m1",
+            Some((None, "forbidden_api_group")),
+            Some((None, "forbidden_scope")),
+            "t1",
+        )
+        .unwrap();
+        let row = get_survey_followup(&c, "m1").unwrap().expect("row must exist");
+        assert_eq!(row.get("survey_status").and_then(Value::as_str), Some("forbidden_api_group"));
+        assert_eq!(row.get("survey").cloned(), Some(Value::Null));
+        assert_eq!(row.get("email_status").and_then(Value::as_str), Some("forbidden_scope"));
+        assert_eq!(row.get("email").cloned(), Some(Value::Null));
+
+        // A later cycle that only refreshes the survey source (now succeeding)
+        // must leave the still-forbidden email status untouched.
+        let survey = json!({ "response_count": 3 });
+        upsert_survey_followup(&c, "m1", Some((Some(&survey), "ok")), None, "t2").unwrap();
+        let row2 = get_survey_followup(&c, "m1").unwrap().expect("row must exist");
+        assert_eq!(row2.get("survey_status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(row2.get("email_status").and_then(Value::as_str), Some("forbidden_scope"),
+            "degradation flag for the untouched source must persist");
     }
 }

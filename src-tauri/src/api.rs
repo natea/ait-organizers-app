@@ -254,6 +254,34 @@ impl ApiClient {
         .await
     }
 
+    // ── Survey + follow-up (specs/survey-followup) ─────────────────────────
+    // Read-only. Gated by the same city-owner / API-group authorization as the
+    // rest of the Agents API; a denial surfaces as ForbiddenApiGroup/Scope/Role
+    // so the panel degrades per-source via is_capability_block().
+
+    /// Per-meetup post-event survey state: scheduler eligibility gates, survey
+    /// presence/open state, settings, attendee counts, and survey email counts
+    /// (sent/opened). This is the primary source for response-rate figures.
+    pub async fn survey_diagnostic(&self, meetup_token: &str) -> AppResult<ApiOk> {
+        self.call(
+            "meetups/survey_diagnostic",
+            json!({ "meetup_token": meetup_token }),
+        )
+        .await
+    }
+
+    /// Cross-meetup survey coverage rollup for a lookback window, scoped to a
+    /// weblog (the endpoint has no `meetup_token` filter). We locate our event's
+    /// row by `meetup_token` in the caller and use it only as response-rate
+    /// context — the diagnostic remains the source of truth for this meetup.
+    pub async fn survey_report(&self, weblog_token: &str, days: u32) -> AppResult<ApiOk> {
+        self.call(
+            "meetups/survey_report",
+            json!({ "weblog_token": weblog_token, "days": days, "include_rows": true }),
+        )
+        .await
+    }
+
     /// Sender-domain deliverability health for a weblog (or the caller's default
     /// scope when `weblog_token` is None): health_score + per-domain rates.
     pub async fn email_deliverability_health_get(

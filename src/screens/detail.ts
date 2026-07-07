@@ -3,9 +3,11 @@
 // per-event scoped data (performance + awaiting) in the background.
 import {
   fetchEventDetail,
+  fetchSurveyFollowup,
   getEventDetail,
   getEventEmail,
   getSendJobThroughput,
+  getSurveyFollowup,
   refreshEmail,
 } from "../api";
 import type {
@@ -15,6 +17,10 @@ import type {
   EventObj,
   GalleryPhoto,
   SendJob,
+  SourceStatus,
+  SurveyFollowup,
+  SurveyFollowupEmail,
+  SurveyFollowupSurvey,
   Throughput,
 } from "../types";
 import { byId, esc, fmt, num } from "../util";
@@ -46,6 +52,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
   let current: string | null = null;
   let email: EventEmail | null = null;
   let throughput = new Map<string, Throughput>();
+  let surveyFollowup: SurveyFollowup | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   function stopPolling(): void {
@@ -60,6 +67,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
       stopPolling();
       email = null;
       throughput = new Map();
+      surveyFollowup = null;
     }
     current = meetupToken;
     const cached = await getEventDetail(meetupToken);
@@ -67,9 +75,13 @@ export function mountDetail(opts: DetailOpts): DetailController {
     else root.innerHTML = `<div class="content"><div class="empty"><div class="spinner"></div></div></div>`;
 
     // Refresh scoped detail (performance + awaiting); degrade gracefully.
+    let latest: EventObj | null = cached;
     try {
       const fresh = await fetchEventDetail(meetupToken);
-      if (fresh && current === meetupToken) render(fresh);
+      if (fresh && current === meetupToken) {
+        render(fresh);
+        latest = fresh;
+      }
     } catch {
       /* keep cached render */
     }
@@ -82,6 +94,18 @@ export function mountDetail(opts: DetailOpts): DetailController {
     } catch {
       /* keep cached email render */
     }
+
+    // Survey + follow-up: past events only, on open + manual refresh only —
+    // never part of the poll loop (design D2, specs/survey-followup).
+    if ((latest?.kind ?? "upcoming") === "past") {
+      await loadSurveyFollowup(meetupToken);
+      try {
+        await fetchSurveyFollowup(meetupToken);
+        await loadSurveyFollowup(meetupToken);
+      } catch {
+        /* keep cached survey render */
+      }
+    }
     scheduleActivePolling(meetupToken);
   }
 
@@ -93,6 +117,9 @@ export function mountDetail(opts: DetailOpts): DetailController {
     const cached = await getEventDetail(meetupToken);
     if (cached && meetupToken === current) render(cached);
     await loadEmail(meetupToken);
+    if ((cached?.kind ?? "upcoming") === "past") {
+      await loadSurveyFollowup(meetupToken);
+    }
   }
 
   // Pull cached email + throughput for active jobs and repaint the panel.
@@ -110,6 +137,18 @@ export function mountDetail(opts: DetailOpts): DetailController {
       /* leave prior email state */
     }
     paintEmail();
+  }
+
+  // Cache-only read of the survey/follow-up row and repaint its slot.
+  async function loadSurveyFollowup(meetupToken: string): Promise<void> {
+    try {
+      const sf = await getSurveyFollowup(meetupToken);
+      if (current !== meetupToken) return;
+      surveyFollowup = sf;
+    } catch {
+      /* leave prior survey-followup state */
+    }
+    paintSurveyFollowup();
   }
 
   // Poll active sends on a gentle cadence; stop once none are active (spec).
@@ -144,6 +183,7 @@ export function mountDetail(opts: DetailOpts): DetailController {
       opts.onBack();
     });
     paintEmail();
+    paintSurveyFollowup();
   }
 
   // The email panel loads asynchronously from the event body, so it fills a
@@ -152,6 +192,14 @@ export function mountDetail(opts: DetailOpts): DetailController {
     const slot = document.getElementById("emailSlot");
     if (!slot) return;
     slot.innerHTML = emailPanelHTML(email, throughput);
+  }
+
+  // Same pattern for the past-event survey/follow-up panel; the slot only
+  // exists in the DOM for past events (bodyHTML omits it for upcoming).
+  function paintSurveyFollowup(): void {
+    const slot = document.getElementById("surveyFollowupSlot");
+    if (!slot) return;
+    slot.innerHTML = surveyFollowupPanelHTML(surveyFollowup);
   }
 
   return { open, refresh };
@@ -222,6 +270,7 @@ function bodyHTML(ev: EventObj): string {
       ${payPanel ? perfPanel : ""}
       <div id="emailSlot" style="grid-column:1/-1"></div>
       ${gallery}
+      ${isPast ? `<div id="surveyFollowupSlot" style="grid-column:1/-1"></div>` : ""}
     </div>
     <div class="lastsync-foot">${foot}</div>`;
 }
@@ -318,6 +367,113 @@ function campaignHTML(c: CampaignPerformance | null): string {
 
 function statTile(label: string, value: string): string {
   return `<div class="stat-tile"><b>${esc(value)}</b><small>${esc(label)}</small></div>`;
+}
+
+// Post-event survey + follow-up panel (specs/survey-followup). Past events
+// only; renders exclusively from the cached `survey_followup` row. Each
+// sub-section (survey, follow-up engagement) degrades independently so one
+// forbidden endpoint never blocks the other or the rest of the recap.
+function surveyFollowupPanelHTML(sf: SurveyFollowup | null): string {
+  if (!sf) {
+    return `<div class="panel"><h4>Survey & follow-up</h4>
+      <div class="empty"><div class="spinner"></div></div></div>`;
+  }
+  return `<div class="panel">
+    <h4>Survey & follow-up</h4>
+    <div class="sf-grid">
+      ${surveySectionHTML(sf.survey_status, sf.survey ?? null)}
+      ${followupSectionHTML(sf.email_status, sf.email ?? null)}
+    </div>
+  </div>`;
+}
+
+function sourceNotAvailableHTML(status: SourceStatus): string {
+  if (status === "forbidden_scope") {
+    return `<div class="not-enabled"><b>Needs city-owner access</b>
+      Your key doesn't have city-owner scope for this chapter.</div>`;
+  }
+  if (status === "forbidden_role") {
+    return `<div class="not-enabled"><b>Needs a different role</b>
+      Your key's role can't read this data.</div>`;
+  }
+  if (status === "forbidden_api_group") {
+    return `<div class="not-enabled"><b>Not enabled for your chapter</b>
+      This API group is switched off for this weblog. Everything else still works.</div>`;
+  }
+  return `<div class="not-enabled">Not available right now.</div>`;
+}
+
+function surveySectionHTML(status: SourceStatus, s: SurveyFollowupSurvey | null): string {
+  if (status === "forbidden_api_group" || status === "forbidden_scope" || status === "forbidden_role" || status === "unavailable") {
+    return `<div class="sf-section"><div class="ep-title">Survey response rate</div>${sourceNotAvailableHTML(status)}</div>`;
+  }
+  const responses = s?.response_count;
+  if (status === "empty" || !s || responses == null || responses === 0) {
+    return `<div class="sf-section"><div class="ep-title">Survey response rate</div>
+      <div class="not-enabled">No survey responses yet.</div></div>`;
+  }
+  // Guard the zero/unknown-denominator case: show the raw count, not a fake rate.
+  const rateHTML =
+    typeof s.response_rate === "number"
+      ? statTile("Response rate", fmtRate(s.response_rate))
+      : statTile("Responses", fmt(responses));
+  const stats = `<div class="email-stats">
+    ${rateHTML}
+    ${typeof s.response_rate === "number" ? statTile("Responses", fmt(responses)) : ""}
+    ${s.eligible_attendees != null ? statTile("Eligible", fmt(s.eligible_attendees)) : ""}
+  </div>`;
+  const themes = themesHTML(s.themes, s.sentiment);
+  return `<div class="sf-section"><div class="ep-title">Survey response rate</div>${stats}${themes}</div>`;
+}
+
+function themesHTML(themes: unknown, sentiment: unknown): string {
+  // Sentiment/themes are opportunistic — omit the block entirely rather than
+  // inferring anything from counts (design D3).
+  if (!themes && !sentiment) return "";
+  const sentimentChip =
+    sentiment != null
+      ? `<span class="theme-chip sentiment">${esc(summarizeUnknown(sentiment))}</span>`
+      : "";
+  const themeChips = Array.isArray(themes)
+    ? themes
+        .slice(0, 8)
+        .map((t) => `<span class="theme-chip">${esc(summarizeUnknown(t))}</span>`)
+        .join("")
+    : themes && typeof themes === "object"
+      ? Object.keys(themes as Record<string, unknown>)
+          .slice(0, 8)
+          .map((k) => `<span class="theme-chip">${esc(k)}</span>`)
+          .join("")
+      : "";
+  if (!sentimentChip && !themeChips) return "";
+  return `<div class="theme-chips">${sentimentChip}${themeChips}</div>`;
+}
+
+function summarizeUnknown(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (typeof v === "number") return String(v);
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    const label = o.label ?? o.name ?? o.theme ?? o.tag;
+    if (typeof label === "string") return label;
+  }
+  return JSON.stringify(v);
+}
+
+function followupSectionHTML(status: SourceStatus, e: SurveyFollowupEmail | null): string {
+  if (status === "forbidden_api_group" || status === "forbidden_scope" || status === "forbidden_role" || status === "unavailable") {
+    return `<div class="sf-section"><div class="ep-title">Follow-up engagement</div>${sourceNotAvailableHTML(status)}</div>`;
+  }
+  if (status === "empty" || !e || e.sends == null) {
+    return `<div class="sf-section"><div class="ep-title">Follow-up engagement</div>
+      <div class="not-enabled">No follow-up email sent for this event yet.</div></div>`;
+  }
+  return `<div class="sf-section"><div class="ep-title">Follow-up engagement</div>
+    <div class="email-stats">
+      ${statTile("Sent", fmt(e.sends))}
+      ${statTile("Open rate", fmtRate(e.open_rate))}
+      ${statTile("Click rate", fmtRate(e.click_rate))}
+    </div></div>`;
 }
 
 function shortTime(iso: string): string {

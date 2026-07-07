@@ -464,6 +464,253 @@ pub async fn fetch_event_detail(app: &AppHandle, meetup_token: &str) -> AppResul
     Ok(())
 }
 
+// ── Survey + follow-up sync (specs/survey-followup) ────────────────────────
+
+const SURVEY_KEY: &str = "survey_followup";
+/// Cross-meetup report lookback window (default per the OpenAPI spec).
+const SURVEY_REPORT_DAYS: u32 = 90;
+
+/// Map an API error to the per-source status enum design D6 defines. Anything
+/// that isn't a capability block degrades to `unavailable` rather than failing
+/// the whole panel.
+fn source_status(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        _ => "unavailable",
+    }
+}
+
+/// True when a JSON value carries no meaningful fields (null, `{}`, or `[]`).
+fn is_blank(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Object(m) => m.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// Locate this event's row in the cross-meetup `survey_report` rollup by
+/// `meetup_token`. Best-effort context only (design D3/task 3.3) — any
+/// failure (including rate limit, which is backed off) just means the report
+/// context is omitted; the diagnostic remains authoritative.
+async fn locate_report_row(api: &ApiClient, app: &AppHandle, weblog_token: &str, meetup_token: &str) -> Option<Value> {
+    if weblog_token.is_empty() {
+        return None;
+    }
+    match api.survey_report(weblog_token, SURVEY_REPORT_DAYS).await {
+        Ok(ok) => {
+            let rows = ok
+                .data
+                .get("rows")
+                .or_else(|| ok.data.get("meetups"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            rows.into_iter().find(|r| {
+                db::pick_str(r, &["meetup_token"]) == Some(meetup_token)
+                    || r.get("refs")
+                        .and_then(|x| db::pick_str(x, &["meetup_token"]))
+                        == Some(meetup_token)
+            })
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SURVEY_KEY, parse_retry_after(&msg));
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Derive the survey summary (response rate guarded against a zero/unknown
+/// denominator) from the diagnostic, falling back to the report row for any
+/// field the diagnostic omits (design D3/D4, task 3.1/3.3).
+fn derive_survey_summary(diag: &Value, report_row: Option<&Value>) -> Value {
+    let eligible = db::pick_num(
+        diag,
+        &["eligible_attendee_count", "attendee_count", "eligible_count", "checked_in_count"],
+    )
+    .or_else(|| {
+        report_row.and_then(|r| {
+            db::pick_num(r, &["eligible_attendee_count", "attendee_count", "eligible_count"])
+        })
+    });
+    let responses = db::pick_num(diag, &["response_count", "responses_count", "survey_response_count"])
+        .or_else(|| report_row.and_then(|r| db::pick_num(r, &["response_count", "responses_count"])));
+    let sent = db::pick_num(diag, &["survey_email_sent_count", "email_sent_count", "sent_count"]);
+    let opened = db::pick_num(diag, &["survey_email_opened_count", "email_opened_count", "opened_count"]);
+    // Never fabricate sentiment/themes — only surface them if the payload has them (D3).
+    let sentiment = diag
+        .get("sentiment")
+        .cloned()
+        .or_else(|| report_row.and_then(|r| r.get("sentiment").cloned()))
+        .filter(|v| !is_blank(v));
+    let themes = diag
+        .get("themes")
+        .cloned()
+        .or_else(|| report_row.and_then(|r| r.get("themes").cloned()))
+        .filter(|v| !is_blank(v));
+    // Guard the zero/unknown-denominator case rather than a fake rate (D4).
+    let response_rate = match (responses, eligible) {
+        (Some(r), Some(e)) if e > 0.0 => Some(r / e),
+        _ => None,
+    };
+    json!({
+        "eligible_attendees": eligible,
+        "response_count": responses,
+        "response_rate": response_rate,
+        "survey_email_sent": sent,
+        "survey_email_opened": opened,
+        "sentiment": sentiment,
+        "themes": themes,
+        "report_row_found": report_row.is_some(),
+    })
+}
+
+/// Aggregate meetup-scoped campaign rows into a headline follow-up engagement
+/// figure (design D5/risk: don't attribute to a single unidentified campaign).
+/// Prefers rows whose label looks like the survey follow-up; falls back to all
+/// rows already scoped to this meetup by the API call when none match, so a
+/// differently-labeled follow-up campaign still counts.
+fn derive_email_summary(campaign_data: &Value) -> Value {
+    let campaigns = campaign_data
+        .get("campaigns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let followup: Vec<&Value> = campaigns
+        .iter()
+        .filter(|c| {
+            let label = db::pick_str(c, &["campaign_label"]).unwrap_or("").to_lowercase();
+            label.contains("follow") || label.contains("survey")
+        })
+        .collect();
+    let rows: Vec<&Value> = if followup.is_empty() {
+        campaigns.iter().collect()
+    } else {
+        followup
+    };
+
+    if rows.is_empty() {
+        return json!({
+            "sends": Value::Null, "delivered": Value::Null, "opens": Value::Null,
+            "clicks": Value::Null, "open_rate": Value::Null, "click_rate": Value::Null,
+            "campaign_count": 0,
+        });
+    }
+
+    let mut sends = 0.0;
+    let mut delivered = 0.0;
+    let mut opens = 0.0;
+    let mut clicks = 0.0;
+    for c in &rows {
+        sends += db::pick_num(c, &["sends", "sent"]).unwrap_or(0.0);
+        delivered += db::pick_num(c, &["delivered"]).unwrap_or(0.0);
+        opens += db::pick_num(c, &["opens"]).unwrap_or(0.0);
+        clicks += db::pick_num(c, &["clicks"]).unwrap_or(0.0);
+    }
+    let open_rate = if sends > 0.0 { Some(opens / sends) } else { None };
+    let click_rate = if sends > 0.0 { Some(clicks / sends) } else { None };
+    json!({
+        "sends": sends,
+        "delivered": delivered,
+        "opens": opens,
+        "clicks": clicks,
+        "open_rate": open_rate,
+        "click_rate": click_rate,
+        "campaign_count": rows.len(),
+    })
+}
+
+/// Fetch survey diagnostic + report (context) + follow-up campaign performance
+/// for one PAST event, on detail-open and manual refresh only (spec: never the
+/// upcoming poll, never for upcoming events). Each source degrades
+/// independently and is cached with its own status (design D6).
+pub async fn fetch_survey_followup(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else {
+        return Ok(());
+    };
+    if in_backoff(app, SURVEY_KEY) {
+        return Ok(());
+    }
+
+    let (weblog_token, is_past) = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        match db::get_event_detail(&conn, meetup_token)? {
+            Some(ev) => {
+                let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("upcoming").to_string();
+                let wl = ev.get("weblog_token").and_then(Value::as_str).unwrap_or_default().to_string();
+                (wl, kind == "past")
+            }
+            None => return Ok(()),
+        }
+    };
+    // Survey/follow-up data is frozen recap data — never fetched for upcoming
+    // events (spec: "Survey and follow-up data source and caching").
+    if !is_past {
+        return Ok(());
+    }
+
+    let now = iso_now();
+
+    // Survey diagnostic — primary source for attendee/response counts.
+    let survey_update: (Option<Value>, &'static str) = match api.survey_diagnostic(meetup_token).await {
+        Ok(ok) if is_blank(&ok.data) => (None, "empty"),
+        Ok(ok) => {
+            let report_row = locate_report_row(&api, app, &weblog_token, meetup_token).await;
+            (Some(derive_survey_summary(&ok.data, report_row.as_ref())), "ok")
+        }
+        Err(e) if e.is_capability_block() => (None, source_status(&e)),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SURVEY_KEY, parse_retry_after(&msg));
+            (None, "unavailable")
+        }
+        Err(_) => (None, "unavailable"),
+    };
+
+    // Follow-up campaign engagement, meetup-scoped.
+    let email_update: (Option<Value>, &'static str) = match api.email_campaign_performance_get(meetup_token).await {
+        Ok(ok) => {
+            let campaigns_empty = ok
+                .data
+                .get("campaigns")
+                .and_then(Value::as_array)
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if campaigns_empty {
+                (None, "empty")
+            } else {
+                (Some(derive_email_summary(&ok.data)), "ok")
+            }
+        }
+        Err(e) if e.is_capability_block() => (None, source_status(&e)),
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SURVEY_KEY, parse_retry_after(&msg));
+            (None, "unavailable")
+        }
+        Err(_) => (None, "unavailable"),
+    };
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::upsert_survey_followup(
+            &conn,
+            meetup_token,
+            Some((survey_update.0.as_ref(), survey_update.1)),
+            Some((email_update.0.as_ref(), email_update.1)),
+            &now,
+        )?;
+    }
+
+    let _ = app.emit("survey_followup:updated", json!({ "meetup_token": meetup_token }));
+    Ok(())
+}
+
 // ── Email lifecycle sync (specs/email-lifecycle) ───────────────────────────
 
 const EMAIL_CHAPTER_KEY: &str = "email_chapter";
