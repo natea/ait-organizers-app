@@ -3,6 +3,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  Board,
+  BoardMessage,
   ChapterDeliverability,
   CheckinAttendeesResult,
   CheckinCommitResult,
@@ -14,8 +16,11 @@ import type {
   EventEmail,
   EventObj,
   EventsPayload,
+  FlaggedPost,
+  FlaggedReason,
   Identity,
   LogoSearchResult,
+  NetworkingWriteSettledEvent,
   NextEvent,
   PromotionDraft,
   PromotionDraftMap,
@@ -34,8 +39,10 @@ import type {
   SponsorDraftProgressEvent,
   SponsorSearchResult,
   SurveyFollowup,
+  Thread,
   Throughput,
   WriteAuditEntry,
+  WritePreview,
 } from "./types";
 
 export function validateAndStore(key: string): Promise<Identity> {
@@ -526,4 +533,178 @@ export function onSpeakerWriteSettled(cb: (e: SpeakerWriteSettledEvent) => void)
 /** Emitted after the talk-proposal pipeline finishes a background fetch. */
 export function onSpeakerPipelineUpdated(cb: (meetupToken: string) => void): Promise<UnlistenFn> {
   return listen<{ meetup_token: string }>("speaker_pipeline:updated", (e) => cb(e.payload.meetup_token));
+}
+
+// ── Networking / Connect (specs/networking-connect) ─────────────────────────
+// Boards, board messages, threads, and the cross-board Attention inbox render
+// only from the SQLite cache. Every mutation (post/reply, reaction toggle,
+// attachment upload, DM) is a two-step prepare/commit pair, same gate as
+// rsvp-screening/attendance-checkin/speaker-review.
+
+/** Cached accessible boards (fast path; no network). */
+export function getNetworkingBoards(): Promise<Board[]> {
+  return invoke("get_networking_boards");
+}
+
+/** Fetch + cache boards and the Attention inbox, then return the boards list. */
+export function refreshNetworking(): Promise<Board[]> {
+  return invoke("refresh_networking");
+}
+
+/** Cached messages for one board (fast path; no network). */
+export function getBoardMessages(boardKey: string): Promise<BoardMessage[]> {
+  return invoke("get_board_messages", { boardKey });
+}
+
+/** Fetch + cache one board's messages, optionally filtered. */
+export function fetchBoardMessages(
+  boardKey: string,
+  mentionedMe?: boolean,
+  needsResponse?: boolean,
+): Promise<BoardMessage[]> {
+  return invoke("fetch_board_messages", {
+    boardKey,
+    mentionedMe: mentionedMe ?? null,
+    needsResponse: needsResponse ?? null,
+  });
+}
+
+/** Cached thread (fast path; no network). */
+export function getThread(boardKey: string, rootPostToken: string): Promise<Thread | null> {
+  return invoke("get_thread", { boardKey, rootPostToken });
+}
+
+/** Fetch + cache one thread (open, or the focus-based/interval refresh of an
+ *  already-open thread), then return it from cache. */
+export function fetchThread(postToken: string, boardKey?: string): Promise<Thread | null> {
+  return invoke("fetch_thread", { boardKey: boardKey ?? null, postToken });
+}
+
+/** Cached cross-board Attention inbox (fast path; no network). */
+export function getFlaggedPosts(reason?: FlaggedReason): Promise<FlaggedPost[]> {
+  return invoke("get_flagged_posts", { reason: reason ?? null });
+}
+
+/** Fetch + cache the Attention inbox, then return it from cache. */
+export function refreshFlaggedPosts(reason?: FlaggedReason): Promise<FlaggedPost[]> {
+  return invoke("refresh_flagged_posts", { reason: reason ?? null });
+}
+
+/** Step 1: bind a confirmation token to an exact post/reply, with optional
+ *  title (topic-type boards) and up to 4 image URLs. */
+export function postCreatePrepare(
+  boardKey: string,
+  content: string,
+  opts?: { title?: string; replyToPostToken?: string; imageUrls?: string[] },
+): Promise<WritePreview> {
+  return invoke("post_create_prepare", {
+    boardKey,
+    content,
+    title: opts?.title ?? null,
+    replyToPostToken: opts?.replyToPostToken ?? null,
+    imageUrls: opts?.imageUrls ?? null,
+  });
+}
+
+/** Step 2: commit the confirmed post/reply. Arguments must exactly match
+ *  what was passed to `postCreatePrepare`, or the token is rejected. */
+export function postCreateCommit(
+  token: string,
+  boardKey: string,
+  content: string,
+  opts?: { title?: string; replyToPostToken?: string; imageUrls?: string[] },
+): Promise<Record<string, unknown>> {
+  return invoke("post_create_commit", {
+    token,
+    boardKey,
+    content,
+    title: opts?.title ?? null,
+    replyToPostToken: opts?.replyToPostToken ?? null,
+    imageUrls: opts?.imageUrls ?? null,
+  });
+}
+
+/** Step 1: bind a confirmation token to a single reaction toggle. */
+export function reactionTogglePrepare(boardKey: string, postToken: string, reactionType: string): Promise<WritePreview> {
+  return invoke("reaction_toggle_prepare", { boardKey, postToken, reactionType });
+}
+
+/** Step 2: commit the confirmed reaction toggle. */
+export function reactionToggleCommit(
+  token: string,
+  boardKey: string,
+  postToken: string,
+  reactionType: string,
+): Promise<Record<string, unknown>> {
+  return invoke("reaction_toggle_commit", { token, boardKey, postToken, reactionType });
+}
+
+/** Step 1: bind a confirmation token to uploading an image from a public URL. */
+export function attachmentUploadPrepare(boardKey: string, imageUrl: string): Promise<WritePreview> {
+  return invoke("attachment_upload_prepare", { boardKey, imageUrl });
+}
+
+/** Step 2: commit the confirmed attachment upload. Returns
+ *  `{ attachment_token, image_url, board_key }` for use in a subsequent post. */
+export function attachmentUploadCommit(token: string, boardKey: string, imageUrl: string): Promise<Record<string, unknown>> {
+  return invoke("attachment_upload_commit", { token, boardKey, imageUrl });
+}
+
+/** Step 1: bind a confirmation token to a DM. At least one of `clientRefs`/
+ *  `emails` is required — the preview shows the resolved recipients. */
+export function directMessagePrepare(
+  content: string,
+  recipients: { clientRefs?: string[]; emails?: string[] },
+): Promise<WritePreview> {
+  return invoke("direct_message_prepare", {
+    clientRefs: recipients.clientRefs ?? null,
+    emails: recipients.emails ?? null,
+    content,
+  });
+}
+
+/** Step 2: commit the confirmed DM. `post_as_ashley` is always false. */
+export function directMessageCommit(
+  token: string,
+  content: string,
+  recipients: { clientRefs?: string[]; emails?: string[] },
+): Promise<Record<string, unknown>> {
+  return invoke("direct_message_commit", {
+    token,
+    clientRefs: recipients.clientRefs ?? null,
+    emails: recipients.emails ?? null,
+    content,
+  });
+}
+
+/** Emitted after boards + the Attention inbox finish a background fetch. */
+export function onNetworkingBoardsUpdated(cb: () => void): Promise<UnlistenFn> {
+  return listen("networking:boards_updated", cb);
+}
+
+export function onNetworkingFlaggedUpdated(cb: () => void): Promise<UnlistenFn> {
+  return listen("networking:flagged_updated", cb);
+}
+
+/** Emitted after one board's messages finish a background fetch. */
+export function onNetworkingBoardUpdated(cb: (boardKey: string) => void): Promise<UnlistenFn> {
+  return listen<{ board_key: string }>("networking:board_updated", (e) => cb(e.payload.board_key));
+}
+
+/** Emitted when a cached board becomes forbidden (`forbidden_scope`) on read
+ *  and is dropped from the cache. */
+export function onNetworkingBoardForbidden(cb: (boardKey: string) => void): Promise<UnlistenFn> {
+  return listen<{ board_key: string }>("networking:board_forbidden", (e) => cb(e.payload.board_key));
+}
+
+/** Emitted after a thread finishes a background fetch. */
+export function onNetworkingThreadUpdated(cb: (boardKey: string, rootPostToken: string) => void): Promise<UnlistenFn> {
+  return listen<{ board_key: string; root_post_token: string }>("networking:thread_updated", (e) =>
+    cb(e.payload.board_key, e.payload.root_post_token),
+  );
+}
+
+/** Emitted after the targeted post-write re-sync settles the cache. */
+export function onNetworkingWriteSettled(cb: (e: NetworkingWriteSettledEvent) => void): Promise<UnlistenFn> {
+  return listen<NetworkingWriteSettledEvent>("networking_write:settled", (e) => cb(e.payload));
 }

@@ -666,6 +666,181 @@ impl ApiClient {
         }
         self.call("rsvps/speaker_proposal_upsert", body).await
     }
+
+    // ── Networking / Connect (specs/networking-connect) ────────────────────
+    // The app's fourth write path, reusing the same write_guard prepare/commit
+    // gate as rsvp-screening, attendance-checkin, and speaker-review. Reads
+    // are GETs (openapi/openapi.yaml is the source of truth for method, not
+    // docs/agents-api.md's prose route table); writes are POSTs. Board access
+    // is membership/visibility-constrained server-side — this client never
+    // computes it.
+
+    /// Search/list message boards the caller can access (`message_board_search`,
+    /// GET, 20 rpm).
+    pub async fn message_board_search(
+        &self,
+        query: Option<&str>,
+        include_direct_messages: bool,
+        include_unread: bool,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut q = vec![
+            ("limit", limit.to_string()),
+            ("include_direct_messages", include_direct_messages.to_string()),
+            ("include_unread", include_unread.to_string()),
+        ];
+        if let Some(v) = query {
+            q.push(("query", v.to_string()));
+        }
+        self.call_get("message_boards/search", &q).await
+    }
+
+    /// Recent messages from one accessible board, with optional mention/
+    /// needs-response filters (`message_board_messages_list`, GET, 20 rpm).
+    pub async fn message_board_messages_list(
+        &self,
+        board_key: &str,
+        mentioned_me: bool,
+        needs_response: bool,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let q = vec![
+            ("board_key", board_key.to_string()),
+            ("mentioned_me", mentioned_me.to_string()),
+            ("needs_response", needs_response.to_string()),
+            ("limit", limit.to_string()),
+        ];
+        self.call_get("message_boards/messages/list", &q).await
+    }
+
+    /// Fetch one thread by board_key + post_token, expanded root-through-replies
+    /// (`message_board_thread_get`, GET, 20 rpm).
+    pub async fn message_board_thread_get(
+        &self,
+        board_key: Option<&str>,
+        post_token: &str,
+        thread_limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut q = vec![
+            ("post_token", post_token.to_string()),
+            ("thread_limit", thread_limit.to_string()),
+        ];
+        if let Some(bk) = board_key {
+            q.push(("board_key", bk.to_string()));
+        }
+        self.call_get("message_boards/threads/get", &q).await
+    }
+
+    /// Search posts across caller-accessible boards (or one board) with
+    /// mention/needs-response filters (`message_board_post_search`, GET, 20 rpm).
+    pub async fn message_board_post_search(
+        &self,
+        mentioned_me: bool,
+        needs_response: bool,
+        board_key: Option<&str>,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut q = vec![
+            ("mentioned_me", mentioned_me.to_string()),
+            ("needs_response", needs_response.to_string()),
+            ("limit", limit.to_string()),
+        ];
+        if let Some(bk) = board_key {
+            q.push(("board_key", bk.to_string()));
+        }
+        self.call_get("message_boards/posts/search", &q).await
+    }
+
+    /// Create a post or reply, optionally attaching up to 4 public image URLs
+    /// (`message_board_post_create`, POST, 10 rpm). Input caps (content <=10000
+    /// chars, image_urls <=4 each <=2048 chars) are enforced here as a
+    /// last-resort net — `commands.rs` validates first and rejects before a
+    /// token is ever prepared.
+    pub async fn message_board_post_create(
+        &self,
+        board_key: &str,
+        content: &str,
+        title: Option<&str>,
+        reply_to_post_token: Option<&str>,
+        image_urls: &[String],
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({
+            "board_key": board_key,
+            "content": cap_chars(content, 10_000),
+        });
+        if let Some(t) = title {
+            body["title"] = json!(cap_chars(t, 300));
+        }
+        if let Some(r) = reply_to_post_token {
+            body["reply_to_post_token"] = json!(r);
+        }
+        if !image_urls.is_empty() {
+            let capped: Vec<String> = image_urls.iter().take(4).map(|u| cap_chars(u, 2048)).collect();
+            body["image_urls"] = json!(capped);
+        }
+        self.call("message_boards/posts/create", body).await
+    }
+
+    /// Toggle an emoji reaction on a post (`message_board_reaction_toggle`,
+    /// POST, 20 rpm). `reaction_type` validity is checked in `commands.rs`
+    /// against the API's documented allowed set before this is ever called.
+    pub async fn message_board_reaction_toggle(
+        &self,
+        board_key: &str,
+        post_token: &str,
+        reaction_type: &str,
+    ) -> AppResult<ApiOk> {
+        self.call(
+            "message_boards/reactions/toggle",
+            json!({ "board_key": board_key, "post_token": post_token, "reaction_type": reaction_type }),
+        )
+        .await
+    }
+
+    /// Upload an image from a public URL for later attachment to a post
+    /// (`message_board_attachment_upload`, POST, 10 rpm). Not on the write
+    /// path most posts take — `post_create`'s `image_urls` is preferred; this
+    /// exists for callers the API requires a pre-uploaded token from.
+    pub async fn message_board_attachment_upload(&self, board_key: &str, image_url: &str) -> AppResult<ApiOk> {
+        self.call(
+            "message_boards/attachments/upload",
+            json!({ "board_key": board_key, "image_url": cap_chars(image_url, 2048) }),
+        )
+        .await
+    }
+
+    /// Create/reuse a normal DM conversation with existing clients and post
+    /// one message (`direct_message_post_create`, POST). `post_as_ashley` is
+    /// always pinned `false` — there is no UI path in this change that sets it
+    /// true (spec: "always authored as the caller").
+    pub async fn direct_message_post_create(
+        &self,
+        client_refs: &[String],
+        emails: &[String],
+        content: &str,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({
+            "content": cap_chars(content, 10_000),
+            "post_as_ashley": false,
+        });
+        if !client_refs.is_empty() {
+            body["client_refs"] = json!(client_refs);
+        }
+        if !emails.is_empty() {
+            body["emails"] = json!(emails);
+        }
+        self.call("message_boards/direct_messages/post", body).await
+    }
+}
+
+/// Char-safe truncation (never splits a multi-byte UTF-8 codepoint) for the
+/// networking-connect input caps (content, titles, URLs).
+fn cap_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
 }
 
 /// Hard cap on the serialized `context` payload for `sponsor_pitch_generate`

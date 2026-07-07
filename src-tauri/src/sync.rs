@@ -2279,3 +2279,348 @@ async fn refresh_speaker_proposal_after_write(app: &AppHandle, meetup_token: &st
         json!({ "meetup_token": meetup_token, "rsvp_ref": rsvp_ref }),
     );
 }
+
+// ── Networking / Connect (specs/networking-connect) ─────────────────────────
+// The app's fourth write path. Boards + the cross-board Attention inbox
+// (mentions/needs-response) refresh on a moderate 180s cadence — separate
+// from the 120s `meetups/upcoming` loop (design: "Polling cadence"). Board
+// messages and threads are fetched on explicit screen-open/focus, not the
+// timer. Writes (`post_create`, `reaction_toggle`, `attachment_upload`,
+// `direct_message_post_create`) are called ONLY from `commands::*_commit`
+// after the write_guard token has already been validated, and never
+// auto-retry on 429 (same posture as every other write feature here).
+
+const NETWORKING_BOARDS_KEY: &str = "networking_boards";
+const NETWORKING_FLAGGED_KEY: &str = "networking_flagged";
+const NETWORKING_MESSAGES_KEY: &str = "networking_messages";
+const NETWORKING_THREAD_KEY: &str = "networking_thread";
+const NETWORKING_WRITE_KEY: &str = "networking_write";
+const NETWORKING_LIST_LIMIT: u32 = 50;
+const NETWORKING_THREAD_LIMIT: u32 = 200;
+
+fn networking_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        AppError::RateLimited(_) => "rate_limited",
+        _ => "unavailable",
+    }
+}
+
+/// Fetch + cache the boards the caller can access (`message_board_search`),
+/// then the cross-board Attention inbox. Called by the 180s poll tick and by
+/// an explicit manual refresh — never by the 120s `meetups/upcoming` loop.
+pub async fn fetch_networking(app: &AppHandle) -> AppResult<()> {
+    let boards = fetch_networking_boards(app).await;
+    let flagged = fetch_networking_flagged(app).await;
+    boards?;
+    flagged?;
+    Ok(())
+}
+
+/// Fetch + cache the accessible boards list (task 4.1). Degrades
+/// non-blockingly on a capability block — previously-cached boards are left
+/// in place, same "degrade, don't erase" posture as the other read features.
+pub async fn fetch_networking_boards(app: &AppHandle) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, NETWORKING_BOARDS_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    let mut keep: Vec<String> = Vec::new();
+    let mut blocked: Option<String> = None;
+
+    match api.message_board_search(None, true, true, NETWORKING_LIST_LIMIT).await {
+        Ok(ok) => {
+            let boards = ok.data.get("boards").and_then(Value::as_array).cloned().unwrap_or_default();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            for board in &boards {
+                if let Some(key) = db::upsert_board(&conn, board, &now)? {
+                    keep.push(key);
+                }
+            }
+            record_rate_locked(&conn, NETWORKING_BOARDS_KEY, &ok.rate);
+        }
+        Err(e) if e.is_capability_block() => {
+            blocked = Some(networking_error_code(&e).to_string());
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_BOARDS_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(_) => {}
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        if blocked.is_none() {
+            db::retain_boards(&conn, &keep)?;
+        }
+        db::set_sync_state(&conn, NETWORKING_BOARDS_KEY, Some(&now), None, None, blocked.is_some(), blocked.as_deref())?;
+    }
+
+    let _ = app.emit("networking:boards_updated", json!({}));
+    Ok(())
+}
+
+/// Fetch + cache the cross-board "Attention" inbox: posts mentioning the
+/// caller and posts needing a response, tagged by reason (task 4.1, spec:
+/// "Mentions / needs-response as a saved cross-board inbox").
+pub async fn fetch_networking_flagged(app: &AppHandle) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, NETWORKING_FLAGGED_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    let mut blocked: Option<String> = None;
+
+    for reason in ["mentioned_me", "needs_response"] {
+        let mentioned_me = reason == "mentioned_me";
+        let needs_response = reason == "needs_response";
+        match api.message_board_post_search(mentioned_me, needs_response, None, 25).await {
+            Ok(ok) => {
+                let matches = ok.data.get("matches").and_then(Value::as_array).cloned().unwrap_or_default();
+                let mut keep: Vec<String> = Vec::new();
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                for m in &matches {
+                    if let Some(token) = db::upsert_flagged_post(&conn, reason, None, m, &now)? {
+                        keep.push(token);
+                    }
+                }
+                db::retain_flagged_posts(&conn, reason, &keep)?;
+                record_rate_locked(&conn, NETWORKING_FLAGGED_KEY, &ok.rate);
+            }
+            Err(e) if e.is_capability_block() => {
+                blocked = Some(networking_error_code(&e).to_string());
+            }
+            Err(AppError::RateLimited(msg)) => {
+                apply_backoff(app, NETWORKING_FLAGGED_KEY, parse_retry_after(&msg));
+            }
+            Err(_) => {}
+        }
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::set_sync_state(&conn, NETWORKING_FLAGGED_KEY, Some(&now), None, None, blocked.is_some(), blocked.as_deref())?;
+    }
+
+    let _ = app.emit("networking:flagged_updated", json!({}));
+    Ok(())
+}
+
+/// Fetch + cache one board's recent messages (task 4.2, per-board view /
+/// filter). An unfiltered fetch (`mentioned_me=false, needs_response=false`)
+/// also prunes rows the sweep no longer returned; a filtered fetch only adds
+/// rows so it never clobbers the rest of the board (spec: "Per-board views
+/// additionally pass mentioned_me/needs_response ... for filtering"). A
+/// `forbidden_scope` on a cached board is a visibility change server-side —
+/// drop the board entirely (spec: "A board becomes forbidden on read").
+pub async fn fetch_board_messages(app: &AppHandle, board_key: &str, mentioned_me: bool, needs_response: bool) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, NETWORKING_MESSAGES_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    match api.message_board_messages_list(board_key, mentioned_me, needs_response, NETWORKING_LIST_LIMIT).await {
+        Ok(ok) => {
+            let messages = ok.data.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+            let mut keep: Vec<String> = Vec::new();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            for m in &messages {
+                if let Some(token) = db::upsert_board_message(&conn, board_key, m, &now)? {
+                    keep.push(token);
+                }
+            }
+            if !mentioned_me && !needs_response {
+                db::retain_board_messages(&conn, board_key, &keep)?;
+            }
+            record_rate_locked(&conn, NETWORKING_MESSAGES_KEY, &ok.rate);
+        }
+        Err(AppError::ForbiddenScope(msg)) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::drop_board(&conn, board_key)?;
+            let _ = app.emit("networking:board_forbidden", json!({ "board_key": board_key }));
+            return Err(AppError::ForbiddenScope(msg));
+        }
+        Err(e) if e.is_capability_block() => {
+            return Err(e);
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_MESSAGES_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(e) => return Err(e),
+    }
+    let _ = app.emit("networking:board_updated", json!({ "board_key": board_key }));
+    Ok(())
+}
+
+/// Fetch + cache one thread (task 4.2). Used both for opening a thread and
+/// for the focus-based/interval refresh of an already-open thread.
+pub async fn fetch_thread(app: &AppHandle, board_key: Option<&str>, post_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, NETWORKING_THREAD_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    match api.message_board_thread_get(board_key, post_token, NETWORKING_THREAD_LIMIT).await {
+        Ok(ok) => {
+            let resolved_board = ok
+                .data
+                .get("refs")
+                .and_then(|r| r.get("board_key"))
+                .and_then(Value::as_str)
+                .or(board_key)
+                .unwrap_or_default()
+                .to_string();
+            let thread = ok.data.get("thread").cloned().unwrap_or(Value::Null);
+            let root = thread
+                .get("root_post_token")
+                .and_then(Value::as_str)
+                .unwrap_or(post_token)
+                .to_string();
+            let matched = thread.get("matched_post_token").and_then(Value::as_str).map(str::to_string);
+            let posts = thread.get("posts").and_then(Value::as_array).cloned().unwrap_or_default();
+            let truncated = thread.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_thread(&conn, &resolved_board, &root, matched.as_deref(), &posts, truncated, &now)?;
+            record_rate_locked(&conn, NETWORKING_THREAD_KEY, &ok.rate);
+            drop(conn);
+            let _ = app.emit(
+                "networking:thread_updated",
+                json!({ "board_key": resolved_board, "root_post_token": root }),
+            );
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_THREAD_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Create a post or reply (`message_board_post_create`). Called ONLY from
+/// `commands::post_create_commit` after the write_guard token has already
+/// been validated. On success, triggers a targeted re-sync of the affected
+/// board (and thread, for a reply) rather than a full cycle (design:
+/// "Writes trigger a targeted re-sync, not a full cycle"). Returns the
+/// created post's API data so the caller can render/highlight it immediately.
+pub async fn networking_post_create(
+    app: &AppHandle,
+    board_key: &str,
+    content: &str,
+    title: Option<&str>,
+    reply_to_post_token: Option<&str>,
+    image_urls: &[String],
+) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.message_board_post_create(board_key, content, title, reply_to_post_token, image_urls).await {
+        Ok(ok) => {
+            let now = iso_now();
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let _ = db::upsert_board_message(&conn, board_key, &ok.data, &now);
+                record_rate_locked(&conn, NETWORKING_WRITE_KEY, &ok.rate);
+            }
+            let _ = fetch_board_messages(app, board_key, false, false).await;
+            if let Some(root) = reply_to_post_token {
+                let _ = fetch_thread(app, Some(board_key), root).await;
+            }
+            let _ = app.emit("networking_write:settled", json!({ "board_key": board_key }));
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Toggle an emoji reaction (`message_board_reaction_toggle`). Called ONLY
+/// from `commands::reaction_toggle_commit` after the token has already been
+/// validated. Re-syncs the board's messages so the updated reaction renders
+/// from cache (spec: "re-syncs the post").
+pub async fn networking_reaction_toggle(app: &AppHandle, board_key: &str, post_token: &str, reaction_type: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.message_board_reaction_toggle(board_key, post_token, reaction_type).await {
+        Ok(ok) => {
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                record_rate_locked(&conn, NETWORKING_WRITE_KEY, &ok.rate);
+            }
+            let _ = fetch_board_messages(app, board_key, false, false).await;
+            let _ = app.emit("networking_write:settled", json!({ "board_key": board_key }));
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Upload an image from a public URL (`message_board_attachment_upload`).
+/// Called ONLY from `commands::attachment_upload_commit`. No cache mutation —
+/// the returned attachment_token/image_url is consumed by a subsequent
+/// `post_create`, which is what actually gets cached.
+pub async fn networking_attachment_upload(app: &AppHandle, board_key: &str, image_url: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.message_board_attachment_upload(board_key, image_url).await {
+        Ok(ok) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            record_rate_locked(&conn, NETWORKING_WRITE_KEY, &ok.rate);
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Post a direct message (`direct_message_post_create`). Called ONLY from
+/// `commands::direct_message_commit`. `post_as_ashley` is always pinned false
+/// in `api.rs`. On success, re-syncs the boards list so a brand-new DM
+/// conversation appears without waiting for the next poll tick.
+pub async fn networking_direct_message_post(app: &AppHandle, client_refs: &[String], emails: &[String], content: &str) -> AppResult<Value> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api.direct_message_post_create(client_refs, emails, content).await {
+        Ok(ok) => {
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                record_rate_locked(&conn, NETWORKING_WRITE_KEY, &ok.rate);
+            }
+            let board_key = ok.data.get("board_key").and_then(Value::as_str).map(str::to_string);
+            if let Some(bk) = &board_key {
+                let _ = fetch_board_messages(app, bk, false, false).await;
+            } else {
+                let _ = fetch_networking_boards(app).await;
+            }
+            let _ = app.emit("networking_write:settled", json!({ "board_key": board_key }));
+            Ok(ok.data)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, NETWORKING_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}

@@ -22,6 +22,12 @@ use state::{AppState, MAIN_LABEL, POPOVER_LABEL, TRAY_ID};
 /// the rate cap — and keeps every card's counts fresh (design D3).
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
 
+/// Networking/Connect poll cadence (specs/networking-connect design
+/// "Polling cadence") — deliberately slower than `POLL_INTERVAL` since boards
+/// and the Attention inbox change less often than event counts, and the
+/// message-boards endpoints share the same overall rate budget.
+const NETWORKING_POLL_INTERVAL: Duration = Duration::from_secs(180);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -73,6 +79,20 @@ pub fn run() {
                 loop {
                     ticker.tick().await;
                     let _ = sync::run_cycle(handle.clone(), false).await;
+                }
+            });
+
+            // Networking/Connect poll loop (specs/networking-connect): boards
+            // + the cross-board Attention inbox, on their own slower cadence,
+            // independent of the events poll above.
+            let net_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = sync::fetch_networking(&net_handle).await;
+                let mut ticker = tokio::time::interval(NETWORKING_POLL_INTERVAL);
+                ticker.tick().await; // consume immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let _ = sync::fetch_networking(&net_handle).await;
                 }
             });
 
@@ -135,6 +155,22 @@ pub fn run() {
             commands::speaker_approval_commit,
             commands::speaker_proposal_prepare,
             commands::speaker_proposal_commit,
+            commands::get_networking_boards,
+            commands::refresh_networking,
+            commands::get_board_messages,
+            commands::fetch_board_messages,
+            commands::get_thread,
+            commands::fetch_thread,
+            commands::get_flagged_posts,
+            commands::refresh_flagged_posts,
+            commands::post_create_prepare,
+            commands::post_create_commit,
+            commands::reaction_toggle_prepare,
+            commands::reaction_toggle_commit,
+            commands::attachment_upload_prepare,
+            commands::attachment_upload_commit,
+            commands::direct_message_prepare,
+            commands::direct_message_commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
