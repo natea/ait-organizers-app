@@ -584,6 +584,18 @@ impl ApiClient {
         }
         self.call("rsvps/bulk_state_update", body).await
     }
+
+    // ── Attendance check-in (specs/attendance-checkin) ─────────────────────
+    // The app's second write path, reusing the same envelope handling as RSVP
+    // screening. Called ONLY from `sync::flush_action_queue`, which itself is
+    // only ever fed by rows the write_guard-gated commands enqueued.
+
+    /// Record a door check-in (`rsvps/mark_attended`, body `{ rsvp_ref }`).
+    /// Sets `confirmed_at` and appends a `rsvp_status_history_list` entry
+    /// server-side; idempotent — an already-attended RSVP stays attended.
+    pub async fn mark_attended(&self, rsvp_ref: &str) -> AppResult<ApiOk> {
+        self.call("rsvps/mark_attended", json!({ "rsvp_ref": rsvp_ref })).await
+    }
 }
 
 /// Hard cap on the serialized `context` payload for `sponsor_pitch_generate`

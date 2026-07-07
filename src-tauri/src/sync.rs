@@ -100,6 +100,12 @@ pub async fn run_cycle(app: AppHandle, force: bool) -> AppResult<()> {
     let result = do_upcoming(&app, &api).await;
     state.syncing.store(false, Ordering::SeqCst);
 
+    // Drain any queued door check-ins on every cycle (poll + manual refresh,
+    // task 3.2) — independent of whether the upcoming-events fetch itself
+    // succeeded, since a rate limit on `meetups/upcoming` shouldn't stall
+    // check-ins that are ready to flush.
+    let _ = flush_action_queue(&app).await;
+
     match result {
         Ok(rate) => {
             record_rate(&app, UPCOMING_KEY, &rate);
@@ -1899,4 +1905,185 @@ async fn refresh_rsvp_after_write(app: &AppHandle, meetup_token: &str, rsvp_refs
         "rsvp_write:settled",
         json!({ "meetup_token": meetup_token, "rsvp_refs": rsvp_refs }),
     );
+}
+
+// ── Attendance check-in (specs/attendance-checkin) ──────────────────────────
+// The door-tap write path. `mark_attended` is only ever called from here, and
+// only for rows `commands::checkin_commit` already enqueued behind the
+// write_guard. A tap never POSTs synchronously — it enqueues, and this flush
+// (run from the poll cycle, manual refresh, and opportunistically right after
+// enqueue) is what actually talks to the network, so a check-in is durable
+// the instant it's queued regardless of connectivity (design D3).
+
+const CHECKIN_WRITE_KEY: &str = "checkin_write";
+const CHECKIN_KIND: &str = "mark_attended";
+
+fn checkin_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        _ => "other",
+    }
+}
+
+/// True when an error response indicates the RSVP was already marked
+/// attended — the API's own idempotency signal, which design D4 requires be
+/// treated as success rather than a failure (e.g. a double-flush racing a
+/// prior success, or a stale queue row surviving a crash).
+fn indicates_already_attended(e: &AppError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("already") && (msg.contains("attend") || msg.contains("checked_in") || msg.contains("check-in") || msg.contains("checked in"))
+}
+
+/// Drain every pending door check-in: POST `mark_attended`, and resolve each
+/// row as `sent` on a real success OR an "already attended" response (design
+/// D4). `429` leaves affected rows pending and backs off rather than failing
+/// them (design D6); `403 forbidden_*` is a terminal hard deny (design D7) —
+/// the row is marked failed and its optimistic check-in reverted, and it is
+/// never retried. Any other error (network/timeout) leaves the row pending
+/// for the next cycle. Called from `run_cycle`, manual refresh, and
+/// opportunistically right after an enqueue while online (task 3.2).
+pub async fn flush_action_queue(app: &AppHandle) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, CHECKIN_WRITE_KEY) {
+        return Ok(());
+    }
+
+    let pending = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::pending_actions(&conn, CHECKIN_KIND)?
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut touched_events: Vec<String> = Vec::new();
+
+    for row in pending {
+        let id = row.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let rsvp_ref = row.get("rsvp_ref").and_then(Value::as_str).unwrap_or_default().to_string();
+        let meetup_token = row.get("meetup_token").and_then(Value::as_str).unwrap_or_default().to_string();
+        let audit_id = row.get("audit_id").and_then(Value::as_str).map(str::to_string);
+        if rsvp_ref.is_empty() {
+            continue;
+        }
+
+        let outcome_now = iso_now();
+        match api.mark_attended(&rsvp_ref).await {
+            Ok(ok) => {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let _ = db::upsert_rsvp_row(&conn, &meetup_token, &ok.data, &outcome_now);
+                db::mark_action_sent(&conn, &id)?;
+                if let Some(aid) = &audit_id {
+                    let _ = db::update_write_audit_outcome(&conn, aid, "ok", None, &outcome_now);
+                }
+                record_rate_locked(&conn, CHECKIN_WRITE_KEY, &ok.rate);
+                if !touched_events.iter().any(|t| t == &meetup_token) {
+                    touched_events.push(meetup_token.clone());
+                }
+            }
+            Err(e) if indicates_already_attended(&e) => {
+                // The API's own idempotency signal (design D4) — resolve like
+                // a success, never a duplicate write_audit/queue entry.
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::mark_action_sent(&conn, &id)?;
+                if let Some(aid) = &audit_id {
+                    let _ = db::update_write_audit_outcome(&conn, aid, "ok", None, &outcome_now);
+                }
+                if !touched_events.iter().any(|t| t == &meetup_token) {
+                    touched_events.push(meetup_token.clone());
+                }
+            }
+            Err(AppError::RateLimited(msg)) => {
+                // Leave pending; retried after the backoff window (design D6)
+                // — stop draining the rest of the queue this cycle too, since
+                // the whole endpoint is now rate-limited.
+                apply_backoff(app, CHECKIN_WRITE_KEY, parse_retry_after(&msg));
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::bump_action_attempt(&conn, &id, Some("rate_limited"))?;
+                break;
+            }
+            Err(e) if e.is_capability_block() => {
+                // Hard deny (design D7) — terminal, never retried, and the
+                // optimistic check-in is reverted so the screen reflects reality.
+                let code = checkin_error_code(&e);
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::mark_action_failed(&conn, &id, code)?;
+                db::revert_checkin(&conn, &rsvp_ref)?;
+                if let Some(aid) = &audit_id {
+                    let _ = db::update_write_audit_outcome(&conn, aid, code, Some(code), &outcome_now);
+                }
+                if !touched_events.iter().any(|t| t == &meetup_token) {
+                    touched_events.push(meetup_token.clone());
+                }
+            }
+            Err(e) => {
+                // Network/timeout/other transient failure — stays pending and
+                // is retried next cycle; not a hard deny.
+                let code = e.code().to_string();
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                db::bump_action_attempt(&conn, &id, Some(&code))?;
+            }
+        }
+    }
+
+    // Reconcile the live count against the server once the queue has moved
+    // (design D5) — refresh each touched event's `checked_in` summary.
+    for meetup_token in &touched_events {
+        let _ = refresh_checkin_count(app, meetup_token).await;
+        let _ = app.emit("checkin:queue_updated", json!({ "meetup_token": meetup_token }));
+    }
+    Ok(())
+}
+
+/// Refresh the server `checked_in` total for one event (`rsvps/summary
+/// status=checked_in`) — the same source the Past tab already uses.
+async fn refresh_checkin_count(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    let ok = api.rsvp_checked_in_count(meetup_token).await?;
+    let checked_in = ok.data.get("total_count").and_then(Value::as_i64);
+    let now = iso_now();
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    // Preserve the cached total_count (RSVP screening's summary) by reading it
+    // back rather than fabricating one here.
+    let total = db::get_event_detail(&conn, meetup_token)
+        .ok()
+        .flatten()
+        .and_then(|ev| ev.get("rsvp_summary").and_then(|s| s.get("total_count")).and_then(Value::as_i64))
+        .unwrap_or(0);
+    db::upsert_summary(&conn, meetup_token, total, checked_in, None, &now)?;
+    Ok(())
+}
+
+/// Live checked-in-vs-attending progress for one event (design D5): the
+/// server's `checked_in` total plus any not-yet-synced local check-ins,
+/// against the event's `attending` total as the denominator.
+pub fn checkin_progress(app: &AppHandle, meetup_token: &str) -> Value {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    let ev = db::get_event_detail(&conn, meetup_token).ok().flatten();
+    let attending = ev
+        .as_ref()
+        .and_then(|e| e.get("rsvps").and_then(|r| r.get("attending")).and_then(Value::as_i64))
+        .unwrap_or(0);
+    let server_checked_in = ev
+        .as_ref()
+        .and_then(|e| e.get("rsvp_summary").and_then(|s| s.get("checked_in")).and_then(Value::as_i64));
+    let pending = db::unsynced_checkin_count(&conn, meetup_token).unwrap_or(0);
+    let checked_in = server_checked_in.unwrap_or(0) + pending;
+    json!({
+        "meetup_token": meetup_token,
+        "attending": attending,
+        "checked_in": checked_in,
+        "server_checked_in": server_checked_in,
+        "pending": pending,
+    })
 }

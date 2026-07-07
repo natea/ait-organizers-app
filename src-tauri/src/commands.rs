@@ -648,3 +648,150 @@ pub async fn rsvp_bulk_state_update_commit(
 
     Ok(json!({ "updated": rsvp_refs.len() }))
 }
+
+// ── Attendance check-in (specs/attendance-checkin) — reuses write_guard ────
+// A door tap still passes through the same prepare/commit confirmation gate
+// as RSVP screening (design D2), just without a blocking modal in between:
+// the frontend calls prepare then immediately commit as one deliberate action
+// (the tap itself IS the confirmation — design D2's "distinct control", not a
+// dialog). The actual `mark_attended` POST never happens inside `commit` — it
+// only enqueues to the durable offline queue; `sync::flush_action_queue` is
+// what talks to the network, so a tap never blocks on connectivity.
+
+fn checkin_payload(rsvp_ref: &str) -> Value {
+    json!({ "action": "checkin_mark_attended", "rsvp_ref": rsvp_ref })
+}
+
+/// Resolve which event the check-in screen targets: an explicit token, or the
+/// same live/next-event selection the tray already uses (design D1).
+fn resolve_checkin_event(app: &AppHandle, meetup_token: Option<String>) -> Option<String> {
+    if let Some(t) = meetup_token.filter(|t| !t.is_empty()) {
+        return Some(t);
+    }
+    sync::next_event_json(app)
+        .and_then(|ev| ev.get("meetup_token").and_then(Value::as_str).map(str::to_string))
+}
+
+/// Cached attendee list for the resolved event (fast path; no network),
+/// annotated with which rows have an unsent check-in still queued.
+#[tauri::command]
+pub fn get_checkin_attendees(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    meetup_token: Option<String>,
+) -> AppResult<Value> {
+    let Some(token) = resolve_checkin_event(&app, meetup_token) else {
+        return Ok(json!({ "meetup_token": Value::Null, "rows": [], "pending_refs": [] }));
+    };
+    let conn = state.db.lock().unwrap();
+    let mut list = db::get_rsvp_rows(&conn, &token)?;
+    let pending = db::pending_checkin_refs(&conn, &token)?;
+    if let Value::Object(ref mut map) = list {
+        map.insert("pending_refs".into(), json!(pending));
+    }
+    Ok(list)
+}
+
+/// Fetch + cache the attendee list for the resolved event, opportunistically
+/// flush any queued check-ins while we're online, then return the merged view.
+#[tauri::command]
+pub async fn fetch_checkin_attendees(app: AppHandle, meetup_token: Option<String>) -> AppResult<Value> {
+    let Some(token) = resolve_checkin_event(&app, meetup_token) else {
+        return Ok(json!({ "meetup_token": Value::Null, "rows": [], "pending_refs": [] }));
+    };
+    sync::fetch_rsvp_list(&app, &token).await?;
+    let _ = sync::flush_action_queue(&app).await;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    let mut list = db::get_rsvp_rows(&conn, &token)?;
+    let pending = db::pending_checkin_refs(&conn, &token)?;
+    if let Value::Object(ref mut map) = list {
+        map.insert("pending_refs".into(), json!(pending));
+    }
+    Ok(list)
+}
+
+/// Live checked-in-vs-attending progress for the resolved event (design D5):
+/// server `checked_in` total plus any not-yet-synced local check-ins.
+#[tauri::command]
+pub fn get_checkin_count(app: AppHandle, meetup_token: Option<String>) -> AppResult<Value> {
+    let Some(token) = resolve_checkin_event(&app, meetup_token) else {
+        return Ok(json!({ "meetup_token": Value::Null, "attending": 0, "checked_in": 0, "pending": 0 }));
+    };
+    Ok(sync::checkin_progress(&app, &token))
+}
+
+/// Terminally-denied check-ins for the resolved event (design D7) — the
+/// screen uses this to disable its controls with an explanatory notice.
+#[tauri::command]
+pub fn get_checkin_denials(state: State<'_, AppState>, app: AppHandle, meetup_token: Option<String>) -> AppResult<Value> {
+    let Some(token) = resolve_checkin_event(&app, meetup_token) else {
+        return Ok(json!([]));
+    };
+    let conn = state.db.lock().unwrap();
+    Ok(json!(db::checkin_denials(&conn, &token)?))
+}
+
+/// Step 1 of the write guardrail for one door check-in: no network call, just
+/// binds a confirmation token to the exact `(rsvp_ref)` mutation.
+#[tauri::command]
+pub fn checkin_prepare(state: State<'_, AppState>, rsvp_ref: String, meetup_token: String) -> AppResult<Value> {
+    let payload = checkin_payload(&rsvp_ref);
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "checkin_mark_attended",
+        "rsvp_ref": rsvp_ref,
+        "meetup_token": meetup_token,
+    }))
+}
+
+/// Step 2: validate the token, then — unless the RSVP is already checked in
+/// or already has an unsent check-in queued (design D4, checked BEFORE
+/// touching the audit/queue tables) — write the `attempted` audit row and
+/// enqueue the check-in. Returns immediately with the optimistic row; the
+/// actual network write happens on the next flush (spawned right after, plus
+/// the regular cycle), so a tap never blocks on connectivity (design D3).
+#[tauri::command]
+pub async fn checkin_commit(app: AppHandle, token: String, rsvp_ref: String, meetup_token: String) -> AppResult<Value> {
+    let payload = checkin_payload(&rsvp_ref);
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let client_token = new_id();
+    let queue_id = new_id();
+    let audit_id = new_id();
+
+    let outcome = {
+        let conn = app_state.db.lock().unwrap();
+        // Insert the attempted audit row first (design D3) so even a crash
+        // between here and the enqueue leaves evidence — but only for a
+        // genuine new enqueue, not a dedupe no-op (task 2.3).
+        let would_dupe = db::get_rsvp_row(&conn, &rsvp_ref)?
+            .and_then(|r| r.get("checked_in").and_then(Value::as_bool))
+            .unwrap_or(false)
+            || db::has_unsent_checkin(&conn, &rsvp_ref)?;
+        if !would_dupe {
+            db::insert_write_audit(
+                &conn, &audit_id, "checkin_mark_attended", Some(&meetup_token), std::slice::from_ref(&rsvp_ref),
+                Some("not_checked_in"), Some("checked_in"), false, true, &now,
+            )?;
+        }
+        db::enqueue_checkin_action(&conn, &queue_id, &rsvp_ref, &meetup_token, &client_token, &audit_id, &now)?
+    };
+
+    // Opportunistic flush (task 3.2) — spawned so the tap's response is
+    // immediate regardless of network conditions (design D3 speed priority).
+    if matches!(outcome, db::EnqueueOutcome::Enqueued) {
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = sync::flush_action_queue(&app2).await;
+        });
+    }
+
+    let conn = app_state.db.lock().unwrap();
+    let row = db::get_rsvp_row(&conn, &rsvp_ref)?.unwrap_or(Value::Null);
+    let queued = matches!(outcome, db::EnqueueOutcome::Enqueued);
+    Ok(json!({ "row": row, "queued": queued }))
+}

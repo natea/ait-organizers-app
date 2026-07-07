@@ -121,6 +121,12 @@ pub fn run() {
             commands::rsvp_state_update_commit,
             commands::rsvp_bulk_state_update_prepare,
             commands::rsvp_bulk_state_update_commit,
+            commands::get_checkin_attendees,
+            commands::fetch_checkin_attendees,
+            commands::get_checkin_count,
+            commands::get_checkin_denials,
+            commands::checkin_prepare,
+            commands::checkin_commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

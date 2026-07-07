@@ -506,6 +506,9 @@ export interface RsvpRow {
   registrant_status_label?: string | null;
   registrant_status_text?: string | null;
   checked_in: boolean;
+  // Door check-in timestamp (specs/attendance-checkin); absent until checked
+  // in, or when the check-in hasn't yet synced to the server.
+  checked_in_at?: string | null;
   score?: number | null;
   updated_at: string;
 }
@@ -570,4 +573,48 @@ export interface WriteAuditEntry {
 export interface RsvpWriteSettledEvent {
   meetup_token: string;
   rsvp_refs: string[];
+}
+
+// ── Attendance check-in (specs/attendance-checkin) ──────────────────────────
+// The door check-in screen reuses `RsvpRow`/the RSVP cache (task 2.1
+// alternative) rather than a parallel shape — `checked_in_at` is the only
+// field it adds. `pending_refs` marks rows with a check-in that's queued but
+// not yet flushed to the server (design D3).
+
+export interface CheckinAttendeesResult {
+  meetup_token: string | null;
+  rows: RsvpRow[];
+  pending_refs: string[];
+}
+
+export interface CheckinCount {
+  meetup_token: string | null;
+  attending: number;
+  checked_in: number;
+  server_checked_in?: number | null;
+  pending: number;
+}
+
+// Returned by `checkinPrepare` — echoed back unchanged to `checkinCommit`,
+// along with the identical `rsvp_ref`, or the guardrail rejects it (tampered).
+export interface CheckinConfirm {
+  token: string;
+  action: "checkin_mark_attended";
+  rsvp_ref: string;
+  meetup_token: string;
+}
+
+export interface CheckinCommitResult {
+  row: RsvpRow | null;
+  queued: boolean;
+}
+
+export interface CheckinQueueUpdatedEvent {
+  meetup_token: string;
+}
+
+// A row whose check-in was terminally denied (design D7) — hard stop, never retried.
+export interface CheckinDenial {
+  rsvp_ref: string;
+  error_code?: string | null;
 }
