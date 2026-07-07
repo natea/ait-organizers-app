@@ -65,7 +65,10 @@ pub fn sign_out(app: AppHandle) -> AppResult<()> {
              DELETE FROM performance_snapshots; DELETE FROM content_pages;
              DELETE FROM email_send_jobs; DELETE FROM email_event_summary;
              DELETE FROM email_throughput; DELETE FROM email_deliverability;
-             DELETE FROM survey_followup; DELETE FROM sync_state;",
+             DELETE FROM survey_followup; DELETE FROM sync_state;
+             DELETE FROM sponsors; DELETE FROM sponsor_search_cache;
+             DELETE FROM sponsor_contacts; DELETE FROM sponsor_contacts_meta;
+             DELETE FROM sponsor_drafts; DELETE FROM sponsor_jobs;",
         );
     }
     // Reset first-sync suppression so re-sign-in doesn't fire stale notifications.
@@ -237,6 +240,106 @@ pub async fn logo_search(
         limit.unwrap_or(20),
     )
     .await
+}
+
+// ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────────
+
+/// Search sponsors (fetch + cache) and return the cached result page. Never
+/// bubbles a capability-block/rate-limit error — those are stored on the
+/// search-cache row so the screen can render a degrade state (task 3.6).
+#[tauri::command]
+pub async fn sponsor_search(
+    app: AppHandle,
+    query: String,
+    city: Option<String>,
+    industry: Option<String>,
+    active_only: Option<bool>,
+) -> AppResult<Value> {
+    sync::sponsor_search(&app, query, city, industry, active_only.unwrap_or(false)).await
+}
+
+/// Cache-only read of one sponsor's contacts (no network) — used for
+/// background re-renders once contacts have already been fetched this session.
+#[tauri::command]
+pub fn get_sponsor_contacts(state: State<'_, AppState>, sponsor_ref: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_sponsor_contacts(&conn, &sponsor_ref)
+}
+
+/// Fetch + cache contacts for one sponsor (explicit action — selecting a
+/// sponsor), replacing the whole cached set, and return the merged view.
+#[tauri::command]
+pub async fn sponsor_contacts_get(app: AppHandle, sponsor_ref: String) -> AppResult<Value> {
+    sync::sponsor_contacts_get(&app, sponsor_ref).await
+}
+
+/// Kick off (or return the id of an already in-flight) sponsor research/pitch
+/// generation job. Returns immediately; progress is reported via the
+/// `sponsor_draft_progress` event. `kind` is `research` or `pitch`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn sponsor_generate(
+    app: AppHandle,
+    kind: String,
+    sponsor_ref: Option<String>,
+    name: Option<String>,
+    domain: Option<String>,
+    city: Option<String>,
+    channel: Option<String>,
+    target_audience: Option<String>,
+    meetup_token: Option<String>,
+    notes: Option<String>,
+) -> AppResult<String> {
+    sync::sponsor_generate(
+        &app,
+        kind,
+        sync::SponsorGenParams {
+            sponsor_ref,
+            name,
+            domain,
+            city,
+            channel,
+            target_audience,
+            meetup_token,
+            notes,
+        },
+    )
+}
+
+/// Cancel an in-flight sponsor generation job; the action falls back to its
+/// cached drafts.
+#[tauri::command]
+pub fn sponsor_generation_cancel(app: AppHandle, job_id: String) -> AppResult<()> {
+    sync::sponsor_generation_cancel(&app, &job_id)
+}
+
+/// All cached drafts for one subject (sponsor_token or free-text company
+/// name), newest first; `kind` narrows to `research` or `pitch`.
+#[tauri::command]
+pub fn get_sponsor_drafts(
+    state: State<'_, AppState>,
+    sponsor_ref: Option<String>,
+    name: Option<String>,
+    kind: Option<String>,
+) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    let subject = db::sponsor_subject_key(sponsor_ref.as_deref(), name.as_deref());
+    db::list_sponsor_drafts(&conn, &subject, kind.as_deref())
+}
+
+/// One cached draft by id, if any.
+#[tauri::command]
+pub fn get_sponsor_draft(state: State<'_, AppState>, draft_id: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_sponsor_draft(&conn, &draft_id)?.unwrap_or(Value::Null))
+}
+
+/// Current state of one sponsor generation job, in case the frontend missed
+/// its event.
+#[tauri::command]
+pub fn get_sponsor_job(state: State<'_, AppState>, job_id: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    Ok(db::get_sponsor_job(&conn, &job_id)?.unwrap_or(Value::Null))
 }
 
 #[tauri::command]

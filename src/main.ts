@@ -6,13 +6,15 @@ import { renderOnboarding } from "./screens/onboarding";
 import { mountOverview, type OverviewController } from "./screens/overview";
 import { mountDetail, type DetailController } from "./screens/detail";
 import { mountEmail, type EmailController } from "./screens/email";
+import { mountSponsors, type SponsorsController } from "./screens/sponsors";
 import { mountSettings, type SettingsController } from "./screens/settings";
 
-type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail" | "scr-email" | "scr-settings";
+type ScreenId = "scr-onboarding" | "scr-overview" | "scr-detail" | "scr-email" | "scr-sponsors" | "scr-settings";
 
 let overview: OverviewController | null = null;
 let detail: DetailController | null = null;
 let email: EmailController | null = null;
+let sponsors: SponsorsController | null = null;
 let settings: SettingsController | null = null;
 let currentDetailToken: string | null = null;
 
@@ -33,6 +35,10 @@ function enterApp(): void {
       show("scr-email");
       email?.open();
     },
+    onOpenSponsors: () => {
+      show("scr-sponsors");
+      sponsors?.open();
+    },
     onOpenSettings: () => {
       show("scr-settings");
       settings?.open();
@@ -46,6 +52,12 @@ function enterApp(): void {
     },
   });
   email = mountEmail({
+    onBack: () => {
+      show("scr-overview");
+      overview?.reload();
+    },
+  });
+  sponsors = mountSponsors({
     onBack: () => {
       show("scr-overview");
       overview?.reload();

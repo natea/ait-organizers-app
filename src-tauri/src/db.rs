@@ -172,6 +172,101 @@ pub fn init(conn: &Connection) -> AppResult<()> {
             fetched_at          TEXT NOT NULL,
             PRIMARY KEY (query, scope, include_co_branded)
         );
+
+        -- Sponsor tools (specs/sponsor-tools). Sponsors found via search are
+        -- upserted here keyed by sponsor_token so a detail open can render a
+        -- sponsor's name/domain/city without holding onto search-query state.
+        CREATE TABLE IF NOT EXISTS sponsors (
+            sponsor_token  TEXT PRIMARY KEY,
+            name           TEXT,
+            domain         TEXT,
+            city           TEXT,
+            short_profile  TEXT,
+            raw_json       TEXT,
+            fetched_at     TEXT NOT NULL
+        );
+
+        -- One row per distinct search (query + filters), storing the ordered
+        -- list of matched sponsor_tokens (the sponsor data itself lives in
+        -- `sponsors`, deduped across searches). Degrade state is per-search so
+        -- a blocked search doesn't stomp a previously successful one.
+        CREATE TABLE IF NOT EXISTS sponsor_search_cache (
+            query          TEXT NOT NULL,
+            city           TEXT NOT NULL DEFAULT '',
+            industry       TEXT NOT NULL DEFAULT '',
+            active_only    INTEGER NOT NULL DEFAULT 0,
+            tokens_json    TEXT,
+            truncated      INTEGER NOT NULL DEFAULT 0,
+            unavailable    INTEGER NOT NULL DEFAULT 0,
+            reason         TEXT,
+            fetched_at     TEXT NOT NULL,
+            PRIMARY KEY (query, city, industry, active_only)
+        );
+
+        -- Contacts for one sponsor. A fresh fetch replaces the whole set for
+        -- that sponsor_token (task 3.1) rather than merging, so stale contacts
+        -- never linger. Email/phone are stored exactly as the API returns them
+        -- (already masked server-side when visibility is off) — the app never
+        -- unmasks; `*_masked` is a display hint only (design D1).
+        CREATE TABLE IF NOT EXISTS sponsor_contacts (
+            sponsor_token  TEXT NOT NULL,
+            contact_id     TEXT NOT NULL,
+            role           TEXT,
+            title          TEXT,
+            email          TEXT,
+            email_masked   INTEGER NOT NULL DEFAULT 0,
+            phone          TEXT,
+            phone_masked   INTEGER NOT NULL DEFAULT 0,
+            linkedin       TEXT,
+            confidence     REAL,
+            raw_json       TEXT,
+            PRIMARY KEY (sponsor_token, contact_id)
+        );
+
+        -- Per-sponsor contact-fetch header: degrade state + cap indicator,
+        -- separate from the contact rows so a blocked/empty fetch doesn't need
+        -- a sentinel contact row.
+        CREATE TABLE IF NOT EXISTS sponsor_contacts_meta (
+            sponsor_token  TEXT PRIMARY KEY,
+            truncated      INTEGER NOT NULL DEFAULT 0,
+            unavailable    INTEGER NOT NULL DEFAULT 0,
+            reason         TEXT,
+            fetched_at     TEXT NOT NULL
+        );
+
+        -- Reusable generated drafts (research brief or pitch) per sponsor/company
+        -- (design D3, task 2.3). Unlike promotion_drafts this keeps history (one
+        -- row per generation, keyed by draft_id) so a regeneration never clobbers
+        -- an earlier draft of a *different* kind or an earlier draft the
+        -- organizer may still want — reopening is explicit, never automatic.
+        CREATE TABLE IF NOT EXISTS sponsor_drafts (
+            draft_id       TEXT PRIMARY KEY,
+            subject        TEXT NOT NULL,
+            sponsor_token  TEXT,
+            company_name   TEXT,
+            kind           TEXT NOT NULL,
+            params_json    TEXT,
+            result_json    TEXT,
+            status         TEXT NOT NULL DEFAULT 'ready',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+
+        -- Tracked async generation jobs for research/pitch (design D2, mirrors
+        -- promotion_jobs). Never polled — created only on an explicit
+        -- user-initiated kickoff.
+        CREATE TABLE IF NOT EXISTS sponsor_jobs (
+            id             TEXT PRIMARY KEY,
+            subject        TEXT NOT NULL,
+            sponsor_token  TEXT,
+            company_name   TEXT,
+            kind           TEXT NOT NULL,
+            params_hash    TEXT,
+            status         TEXT NOT NULL DEFAULT 'pending',
+            started_at     TEXT NOT NULL,
+            error_code     TEXT,
+            draft_id       TEXT
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -1273,6 +1368,417 @@ pub fn get_logo_cache(
     Ok(row)
 }
 
+// ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────────
+
+/// Build the (sponsor_token or free-text-company-name) key used to correlate
+/// jobs/drafts to a subject regardless of which one the caller supplied.
+pub fn sponsor_subject_key(sponsor_token: Option<&str>, name: Option<&str>) -> String {
+    match sponsor_token {
+        Some(t) if !t.is_empty() => format!("token:{t}"),
+        _ => format!("name:{}", name.unwrap_or("").trim().to_lowercase()),
+    }
+}
+
+/// Upsert one sponsor row from a search match (fields read defensively — live
+/// shapes are unverifiable, so every name has fallbacks).
+fn upsert_sponsor_row(conn: &Connection, m: &Value, now: &str) -> AppResult<Option<String>> {
+    let Some(token) = pick_str(m, &["sponsor_token", "token"]) else {
+        return Ok(None);
+    };
+    let name = pick_str(m, &["name", "company_name", "sponsor_name"]);
+    let domain = pick_str(m, &["domain", "website", "website_url"]);
+    let city = pick_str(m, &["city"]);
+    let profile = pick_str(m, &["short_profile", "profile", "summary", "description"]);
+    conn.execute(
+        "INSERT INTO sponsors (sponsor_token, name, domain, city, short_profile, raw_json, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(sponsor_token) DO UPDATE SET
+           name=excluded.name,
+           domain=excluded.domain,
+           city=excluded.city,
+           short_profile=excluded.short_profile,
+           raw_json=excluded.raw_json,
+           fetched_at=excluded.fetched_at",
+        params![token, name, domain, city, profile, m.to_string(), now],
+    )?;
+    Ok(Some(token.to_string()))
+}
+
+/// Cache a sponsor search result page: upsert each matched sponsor row, then
+/// record this query's ordered token list under its own degrade state so a
+/// later blocked/failed search doesn't erase a previously successful one for a
+/// *different* query (task 3.1).
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_sponsor_search(
+    conn: &Connection,
+    query: &str,
+    city: &str,
+    industry: &str,
+    active_only: bool,
+    matches: &[Value],
+    truncated: bool,
+    unavailable: bool,
+    reason: Option<&str>,
+    now: &str,
+) -> AppResult<()> {
+    let mut tokens = Vec::new();
+    for m in matches {
+        if let Some(t) = upsert_sponsor_row(conn, m, now)? {
+            tokens.push(t);
+        }
+    }
+    conn.execute(
+        "INSERT INTO sponsor_search_cache
+           (query, city, industry, active_only, tokens_json, truncated, unavailable, reason, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(query, city, industry, active_only) DO UPDATE SET
+           tokens_json=excluded.tokens_json,
+           truncated=excluded.truncated,
+           unavailable=excluded.unavailable,
+           reason=excluded.reason,
+           fetched_at=excluded.fetched_at",
+        params![
+            query,
+            city,
+            industry,
+            active_only as i64,
+            json!(tokens).to_string(),
+            truncated as i64,
+            unavailable as i64,
+            reason,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+/// The cached search result for one query+filters combo, with sponsor rows
+/// resolved from `sponsors` in their original match order.
+pub fn get_sponsor_search(
+    conn: &Connection,
+    query: &str,
+    city: &str,
+    industry: &str,
+    active_only: bool,
+) -> AppResult<Value> {
+    let row = conn
+        .query_row(
+            "SELECT tokens_json, truncated, unavailable, reason, fetched_at
+             FROM sponsor_search_cache WHERE query = ?1 AND city = ?2 AND industry = ?3 AND active_only = ?4",
+            params![query, city, industry, active_only as i64],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((tokens_json, truncated, unavailable, reason, fetched_at)) = row else {
+        return Ok(json!({
+            "results": Value::Array(vec![]), "truncated": false,
+            "unavailable": false, "reason": Value::Null, "fetched_at": Value::Null,
+        }));
+    };
+    let tokens: Vec<String> = tokens_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let mut results = Vec::new();
+    for t in &tokens {
+        if let Some(v) = get_sponsor(conn, t)? {
+            results.push(v);
+        }
+    }
+    Ok(json!({
+        "results": results,
+        "truncated": truncated,
+        "unavailable": unavailable,
+        "reason": reason,
+        "fetched_at": fetched_at,
+    }))
+}
+
+/// One cached sponsor row by token (raw_json, unpacked), or `None`.
+pub fn get_sponsor(conn: &Connection, sponsor_token: &str) -> AppResult<Option<Value>> {
+    let raw = conn
+        .query_row(
+            "SELECT raw_json FROM sponsors WHERE sponsor_token = ?1",
+            params![sponsor_token],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()))
+}
+
+/// Cache the contacts for one sponsor. Replaces the whole set for that
+/// sponsor_token (task 3.1) — a fresh fetch never merges with stale rows.
+pub fn upsert_sponsor_contacts(
+    conn: &Connection,
+    sponsor_token: &str,
+    contacts: &[Value],
+    truncated: bool,
+    unavailable: bool,
+    reason: Option<&str>,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "DELETE FROM sponsor_contacts WHERE sponsor_token = ?1",
+        params![sponsor_token],
+    )?;
+    for (i, c) in contacts.iter().enumerate() {
+        let contact_id = pick_str(c, &["contact_id", "id", "token"])
+            .map(str::to_string)
+            .unwrap_or_else(|| i.to_string());
+        let role = pick_str(c, &["role"]);
+        let title = pick_str(c, &["title", "job_title"]);
+        let email = pick_str(c, &["email", "contact_email"]);
+        let phone = pick_str(c, &["phone", "phone_number"]);
+        let linkedin = pick_str(c, &["linkedin", "linkedin_url"]);
+        let confidence = pick_num(c, &["confidence", "match_confidence", "score"]);
+        let email_masked = field_masked(c, "email_masked", email);
+        let phone_masked = field_masked(c, "phone_masked", phone);
+        conn.execute(
+            "INSERT INTO sponsor_contacts
+               (sponsor_token, contact_id, role, title, email, email_masked, phone, phone_masked, linkedin, confidence, raw_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(sponsor_token, contact_id) DO UPDATE SET
+               role=excluded.role, title=excluded.title, email=excluded.email,
+               email_masked=excluded.email_masked, phone=excluded.phone,
+               phone_masked=excluded.phone_masked, linkedin=excluded.linkedin,
+               confidence=excluded.confidence, raw_json=excluded.raw_json",
+            params![
+                sponsor_token, contact_id, role, title, email, email_masked as i64,
+                phone, phone_masked as i64, linkedin, confidence, c.to_string()
+            ],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO sponsor_contacts_meta (sponsor_token, truncated, unavailable, reason, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(sponsor_token) DO UPDATE SET
+           truncated=excluded.truncated, unavailable=excluded.unavailable,
+           reason=excluded.reason, fetched_at=excluded.fetched_at",
+        params![sponsor_token, truncated as i64, unavailable as i64, reason, now],
+    )?;
+    Ok(())
+}
+
+/// True when an explicit `<field>_masked` boolean is set, else inferred from a
+/// mask sentinel (`*`) in the value — never inferred as unmasked from absence.
+fn field_masked(c: &Value, explicit_field: &str, value: Option<&str>) -> bool {
+    if let Some(b) = c.get(explicit_field).and_then(Value::as_bool) {
+        return b;
+    }
+    value.map(|v| v.contains('*')).unwrap_or(false)
+}
+
+/// Cached contacts for one sponsor (role/title/contact fields + masking hints).
+pub fn get_sponsor_contacts(conn: &Connection, sponsor_token: &str) -> AppResult<Value> {
+    let meta = conn
+        .query_row(
+            "SELECT truncated, unavailable, reason, fetched_at FROM sponsor_contacts_meta WHERE sponsor_token = ?1",
+            params![sponsor_token],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? != 0,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut stmt = conn.prepare(
+        "SELECT contact_id, role, title, email, email_masked, phone, phone_masked, linkedin, confidence
+         FROM sponsor_contacts WHERE sponsor_token = ?1 ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map(params![sponsor_token], |r| {
+        Ok(json!({
+            "contact_id": r.get::<_, String>(0)?,
+            "role": r.get::<_, Option<String>>(1)?,
+            "title": r.get::<_, Option<String>>(2)?,
+            "email": r.get::<_, Option<String>>(3)?,
+            "email_masked": r.get::<_, i64>(4)? != 0,
+            "phone": r.get::<_, Option<String>>(5)?,
+            "phone_masked": r.get::<_, i64>(6)? != 0,
+            "linkedin": r.get::<_, Option<String>>(7)?,
+            "confidence": r.get::<_, Option<f64>>(8)?,
+        }))
+    })?;
+    let contacts: Vec<Value> = rows.filter_map(Result::ok).collect();
+    let (truncated, unavailable, reason, fetched_at) = meta.unwrap_or((false, false, None, String::new()));
+    Ok(json!({
+        "sponsor_token": sponsor_token,
+        "contacts": contacts,
+        "truncated": truncated,
+        "unavailable": unavailable,
+        "reason": reason,
+        "fetched_at": if fetched_at.is_empty() { Value::Null } else { json!(fetched_at) },
+    }))
+}
+
+/// Insert a completed draft (research brief or pitch). History is kept — one
+/// row per generation — so regenerating never clobbers an earlier draft of a
+/// different kind or an earlier draft the organizer wants to keep.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_sponsor_draft(
+    conn: &Connection,
+    draft_id: &str,
+    subject: &str,
+    sponsor_token: Option<&str>,
+    company_name: Option<&str>,
+    kind: &str,
+    params: &Value,
+    result: &Value,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO sponsor_drafts
+           (draft_id, subject, sponsor_token, company_name, kind, params_json, result_json, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?8)",
+        params![
+            draft_id, subject, sponsor_token, company_name, kind,
+            params.to_string(), result.to_string(), now
+        ],
+    )?;
+    Ok(())
+}
+
+fn sponsor_draft_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "draft_id": r.get::<_, String>(0)?,
+        "sponsor_token": r.get::<_, Option<String>>(1)?,
+        "company_name": r.get::<_, Option<String>>(2)?,
+        "kind": r.get::<_, String>(3)?,
+        "params": r.get::<_, Option<String>>(4)?
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "result": r.get::<_, Option<String>>(5)?
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        "status": r.get::<_, String>(6)?,
+        "created_at": r.get::<_, String>(7)?,
+        "updated_at": r.get::<_, String>(8)?,
+    }))
+}
+
+const DRAFT_COLS: &str = "draft_id, sponsor_token, company_name, kind, params_json, result_json, status, created_at, updated_at";
+
+/// One draft by id, or `None`.
+pub fn get_sponsor_draft(conn: &Connection, draft_id: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {DRAFT_COLS} FROM sponsor_drafts WHERE draft_id = ?1");
+    let row = conn
+        .query_row(&sql, params![draft_id], sponsor_draft_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// All cached drafts for one subject (sponsor_token or free-text company),
+/// newest first, so the organizer can reopen a prior draft without
+/// regenerating (design D3). `kind` narrows to `research` or `pitch`.
+pub fn list_sponsor_drafts(conn: &Connection, subject: &str, kind: Option<&str>) -> AppResult<Value> {
+    let drafts: Vec<Value> = if let Some(k) = kind {
+        let sql = format!("SELECT {DRAFT_COLS} FROM sponsor_drafts WHERE subject = ?1 AND kind = ?2 ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![subject, k], sponsor_draft_row)?;
+        rows.filter_map(Result::ok).collect()
+    } else {
+        let sql = format!("SELECT {DRAFT_COLS} FROM sponsor_drafts WHERE subject = ?1 ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![subject], sponsor_draft_row)?;
+        rows.filter_map(Result::ok).collect()
+    };
+    Ok(json!(drafts))
+}
+
+/// Create a job row in `pending` status. Kickoff must check
+/// `find_active_sponsor_job` first — this always inserts.
+#[allow(clippy::too_many_arguments)]
+pub fn create_sponsor_job(
+    conn: &Connection,
+    id: &str,
+    subject: &str,
+    sponsor_token: Option<&str>,
+    company_name: Option<&str>,
+    kind: &str,
+    params_hash: &str,
+    now: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO sponsor_jobs (id, subject, sponsor_token, company_name, kind, params_hash, status, started_at, error_code, draft_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, NULL, NULL)",
+        params![id, subject, sponsor_token, company_name, kind, params_hash, now],
+    )?;
+    Ok(())
+}
+
+/// Move a job to a new status (`running`, `ready`, `error`, `timeout`,
+/// `cancelled`), with an optional error code and, on success, the resulting
+/// draft id.
+pub fn set_sponsor_job_status(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    error_code: Option<&str>,
+    draft_id: Option<&str>,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE sponsor_jobs SET status = ?2, error_code = ?3, draft_id = COALESCE(?4, draft_id) WHERE id = ?1",
+        params![id, status, error_code, draft_id],
+    )?;
+    Ok(())
+}
+
+/// The in-flight (`pending`/`running`) job id for one (subject, kind), if
+/// any — suppresses a duplicate kickoff and guards the tight 10rpm generation
+/// budget (spec: "MUST prevent overlapping generations").
+pub fn find_active_sponsor_job(conn: &Connection, subject: &str, kind: &str) -> AppResult<Option<String>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM sponsor_jobs
+             WHERE subject = ?1 AND kind = ?2 AND status IN ('pending', 'running')
+             ORDER BY started_at DESC LIMIT 1",
+            params![subject, kind],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// One job's current state, for the frontend to poll if it missed an event.
+pub fn get_sponsor_job(conn: &Connection, id: &str) -> AppResult<Option<Value>> {
+    let row = conn
+        .query_row(
+            "SELECT id, subject, sponsor_token, company_name, kind, status, started_at, error_code, draft_id
+             FROM sponsor_jobs WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "subject": r.get::<_, String>(1)?,
+                    "sponsor_token": r.get::<_, Option<String>>(2)?,
+                    "company_name": r.get::<_, Option<String>>(3)?,
+                    "kind": r.get::<_, String>(4)?,
+                    "status": r.get::<_, String>(5)?,
+                    "started_at": r.get::<_, String>(6)?,
+                    "error_code": r.get::<_, Option<String>>(7)?,
+                    "draft_id": r.get::<_, Option<String>>(8)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Drop a job row entirely — used on cancel, so the action falls back to
+/// showing only its cached drafts (no partial draft body is ever written).
+pub fn delete_sponsor_job(conn: &Connection, id: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM sponsor_jobs WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,5 +2071,175 @@ mod tests {
 
         // A different include_co_branded is a distinct cache key.
         assert!(get_logo_cache(&c, "denver", "smart_match", true).unwrap().is_none());
+    }
+
+    // ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────
+
+    #[test]
+    fn sponsor_search_round_trip_resolves_sponsor_rows_in_order() {
+        let c = mem();
+        let matches = vec![
+            json!({ "sponsor_token": "sp1", "name": "Acme Robotics", "city": "Denver", "domain": "acme.dev" }),
+            json!({ "sponsor_token": "sp2", "name": "Beta Corp", "city": "Denver" }),
+        ];
+        upsert_sponsor_search(&c, "acme", "", "", false, &matches, false, false, None, "t1").unwrap();
+
+        let res = get_sponsor_search(&c, "acme", "", "", false).unwrap();
+        let results = res.get("results").and_then(Value::as_array).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].get("sponsor_token").and_then(Value::as_str), Some("sp1"));
+        assert_eq!(results[0].get("name").and_then(Value::as_str), Some("Acme Robotics"));
+        assert_eq!(res.get("truncated").and_then(Value::as_bool), Some(false));
+        assert_eq!(res.get("unavailable").and_then(Value::as_bool), Some(false));
+
+        // A distinct query has its own cache slot and doesn't see these results.
+        let empty = get_sponsor_search(&c, "other", "", "", false).unwrap();
+        assert_eq!(empty.get("results").and_then(Value::as_array).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sponsor_search_degrade_state_is_isolated_per_query() {
+        let c = mem();
+        upsert_sponsor_search(&c, "ok_query", "", "", false, &[], false, false, None, "t1").unwrap();
+        upsert_sponsor_search(&c, "blocked_query", "", "", false, &[], false, true, Some("forbidden_api_group"), "t1").unwrap();
+
+        let ok = get_sponsor_search(&c, "ok_query", "", "", false).unwrap();
+        assert_eq!(ok.get("unavailable").and_then(Value::as_bool), Some(false));
+
+        let blocked = get_sponsor_search(&c, "blocked_query", "", "", false).unwrap();
+        assert_eq!(blocked.get("unavailable").and_then(Value::as_bool), Some(true));
+        assert_eq!(blocked.get("reason").and_then(Value::as_str), Some("forbidden_api_group"));
+    }
+
+    #[test]
+    fn sponsor_contacts_round_trip_and_masking_flags() {
+        let c = mem();
+        let contacts = vec![
+            json!({ "contact_id": "c1", "role": "Marketing", "title": "VP Marketing", "email": "***@acme.dev", "linkedin": "in/x" }),
+            json!({ "contact_id": "c2", "role": "Sales", "email": "sales@acme.dev", "email_masked": false }),
+        ];
+        upsert_sponsor_contacts(&c, "sp1", &contacts, false, false, None, "t1").unwrap();
+
+        let row = get_sponsor_contacts(&c, "sp1").unwrap();
+        let list = row.get("contacts").and_then(Value::as_array).unwrap();
+        assert_eq!(list.len(), 2);
+        // Masking is inferred from the sentinel value when no explicit flag is present.
+        assert_eq!(list[0].get("email_masked").and_then(Value::as_bool), Some(true));
+        assert_eq!(list[0].get("email").and_then(Value::as_str), Some("***@acme.dev"));
+        // An explicit `email_masked: false` is honored even though absent here.
+        assert_eq!(list[1].get("email_masked").and_then(Value::as_bool), Some(false));
+        assert_eq!(row.get("unavailable").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn sponsor_contacts_refetch_replaces_the_whole_set() {
+        let c = mem();
+        upsert_sponsor_contacts(&c, "sp1", &[json!({ "contact_id": "c1", "role": "Old" })], false, false, None, "t1").unwrap();
+        upsert_sponsor_contacts(&c, "sp1", &[json!({ "contact_id": "c2", "role": "New" })], false, false, None, "t2").unwrap();
+
+        let row = get_sponsor_contacts(&c, "sp1").unwrap();
+        let list = row.get("contacts").and_then(Value::as_array).unwrap();
+        assert_eq!(list.len(), 1, "a fresh fetch must replace stale contacts, not merge with them");
+        assert_eq!(list[0].get("role").and_then(Value::as_str), Some("New"));
+    }
+
+    #[test]
+    fn sponsor_draft_upsert_per_kind_does_not_clobber_another_kind() {
+        let c = mem();
+        let subject = sponsor_subject_key(Some("sp1"), None);
+        insert_sponsor_draft(&c, "d1", &subject, Some("sp1"), None, "research", &json!({}), &json!({ "research_summary": "brief" }), "t1").unwrap();
+        insert_sponsor_draft(&c, "d2", &subject, Some("sp1"), None, "pitch", &json!({}), &json!({ "pitch_text": "hello" }), "t2").unwrap();
+
+        let research = list_sponsor_drafts(&c, &subject, Some("research")).unwrap();
+        let research_arr = research.as_array().unwrap();
+        assert_eq!(research_arr.len(), 1);
+        assert_eq!(
+            research_arr[0].get("result").and_then(|r| r.get("research_summary")).and_then(Value::as_str),
+            Some("brief"),
+            "generating a pitch draft must not clobber the research draft for the same subject"
+        );
+
+        let pitch = list_sponsor_drafts(&c, &subject, Some("pitch")).unwrap();
+        let pitch_arr = pitch.as_array().unwrap();
+        assert_eq!(pitch_arr.len(), 1);
+        assert_eq!(pitch_arr[0].get("result").and_then(|r| r.get("pitch_text")).and_then(Value::as_str), Some("hello"));
+
+        let all = list_sponsor_drafts(&c, &subject, None).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2, "unfiltered list must include both kinds");
+    }
+
+    #[test]
+    fn sponsor_draft_history_keeps_prior_generations() {
+        let c = mem();
+        let subject = sponsor_subject_key(None, Some("Acme Robotics"));
+        insert_sponsor_draft(&c, "d1", &subject, None, Some("Acme Robotics"), "research", &json!({}), &json!({ "research_summary": "v1" }), "t1").unwrap();
+        insert_sponsor_draft(&c, "d2", &subject, None, Some("Acme Robotics"), "research", &json!({}), &json!({ "research_summary": "v2" }), "t2").unwrap();
+
+        let drafts = list_sponsor_drafts(&c, &subject, Some("research")).unwrap();
+        let arr = drafts.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "regeneration must not clobber the earlier draft — history is kept");
+        // Newest first.
+        assert_eq!(arr[0].get("draft_id").and_then(Value::as_str), Some("d2"));
+        assert_eq!(arr[1].get("draft_id").and_then(Value::as_str), Some("d1"));
+    }
+
+    #[test]
+    fn sponsor_job_status_transitions_and_duplicate_suppression() {
+        let c = mem();
+        let subject = sponsor_subject_key(Some("sp1"), None);
+        create_sponsor_job(&c, "job1", &subject, Some("sp1"), None, "research", "hash1", "t1").unwrap();
+        let job = get_sponsor_job(&c, "job1").unwrap().expect("job must exist");
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("pending"));
+
+        // Duplicate kickoff suppression: a pending job for the same (subject, kind)
+        // is found by find_active_sponsor_job (rate-limit guard).
+        assert_eq!(find_active_sponsor_job(&c, &subject, "research").unwrap().as_deref(), Some("job1"));
+        // A different kind for the same subject is not blocked.
+        assert!(find_active_sponsor_job(&c, &subject, "pitch").unwrap().is_none());
+
+        set_sponsor_job_status(&c, "job1", "running", None, None).unwrap();
+        assert_eq!(get_sponsor_job(&c, "job1").unwrap().unwrap().get("status").and_then(Value::as_str), Some("running"));
+        assert!(find_active_sponsor_job(&c, &subject, "research").unwrap().is_some());
+
+        set_sponsor_job_status(&c, "job1", "ready", None, Some("d1")).unwrap();
+        let job = get_sponsor_job(&c, "job1").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("ready"));
+        assert_eq!(job.get("draft_id").and_then(Value::as_str), Some("d1"));
+        assert!(find_active_sponsor_job(&c, &subject, "research").unwrap().is_none(), "a terminal job must no longer be in-flight");
+    }
+
+    #[test]
+    fn sponsor_job_error_and_timeout_carry_a_code() {
+        let c = mem();
+        let subject = sponsor_subject_key(Some("sp1"), None);
+        create_sponsor_job(&c, "job2", &subject, Some("sp1"), None, "pitch", "hash2", "t1").unwrap();
+        set_sponsor_job_status(&c, "job2", "timeout", Some("timeout"), None).unwrap();
+        let job = get_sponsor_job(&c, "job2").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("timeout"));
+        assert_eq!(job.get("error_code").and_then(Value::as_str), Some("timeout"));
+
+        create_sponsor_job(&c, "job3", &subject, Some("sp1"), None, "research", "hash3", "t1").unwrap();
+        set_sponsor_job_status(&c, "job3", "error", Some("rate_limited"), None).unwrap();
+        let job = get_sponsor_job(&c, "job3").unwrap().unwrap();
+        assert_eq!(job.get("status").and_then(Value::as_str), Some("error"));
+        assert_eq!(job.get("error_code").and_then(Value::as_str), Some("rate_limited"));
+    }
+
+    #[test]
+    fn sponsor_job_cancel_deletes_the_row_and_frees_the_slot() {
+        let c = mem();
+        let subject = sponsor_subject_key(Some("sp1"), None);
+        create_sponsor_job(&c, "job4", &subject, Some("sp1"), None, "research", "hash4", "t1").unwrap();
+        delete_sponsor_job(&c, "job4").unwrap();
+        assert!(get_sponsor_job(&c, "job4").unwrap().is_none());
+        assert!(find_active_sponsor_job(&c, &subject, "research").unwrap().is_none());
+    }
+
+    #[test]
+    fn sponsor_subject_key_distinguishes_token_and_name() {
+        assert_eq!(sponsor_subject_key(Some("sp1"), None), "token:sp1");
+        assert_eq!(sponsor_subject_key(None, Some("Acme Robotics")), "name:acme robotics");
+        // A blank sponsor_token falls back to the name form.
+        assert_eq!(sponsor_subject_key(Some(""), Some("Acme")), "name:acme");
     }
 }

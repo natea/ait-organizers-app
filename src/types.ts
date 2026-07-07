@@ -401,3 +401,86 @@ export interface LogoSearchResult {
   } | null;
   fetched_at: string;
 }
+
+// ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────────
+// Sponsor search + contacts are cached reads; research/pitch are agent-backed
+// generation drafts, tracked as background jobs and cached per subject/kind so
+// reopening a draft never re-spends a slow (~20s), rate-limited (10 rpm) call.
+
+export interface SponsorMatch {
+  sponsor_token: string;
+  name?: string;
+  domain?: string;
+  city?: string;
+  short_profile?: string;
+  [k: string]: unknown;
+}
+
+export interface SponsorSearchResult {
+  results: SponsorMatch[];
+  truncated: boolean;
+  unavailable: boolean;
+  reason?: string | null;
+  fetched_at?: string | null;
+}
+
+export interface SponsorContact {
+  contact_id: string;
+  role?: string | null;
+  title?: string | null;
+  email?: string | null;
+  email_masked: boolean;
+  phone?: string | null;
+  phone_masked: boolean;
+  linkedin?: string | null;
+  confidence?: number | null;
+}
+
+export interface SponsorContactsResult {
+  sponsor_token: string;
+  contacts: SponsorContact[];
+  truncated: boolean;
+  unavailable: boolean;
+  reason?: string | null;
+  fetched_at?: string | null;
+}
+
+export type SponsorDraftKind = "research" | "pitch";
+
+export type SponsorJobStatus =
+  | "pending"
+  | "running"
+  | "ready"
+  | "error"
+  | "timeout"
+  | "cancelled";
+
+export interface SponsorDraftProgressEvent {
+  job_id: string;
+  subject: string;
+  kind: SponsorDraftKind;
+  status: SponsorJobStatus;
+  error_code?: string | null;
+  draft_id?: string | null;
+}
+
+// `result` is the raw envelope `data` persisted verbatim — unknown/added
+// fields pass through rather than being dropped.
+export interface SponsorDraft {
+  draft_id: string;
+  sponsor_token?: string | null;
+  company_name?: string | null;
+  kind: SponsorDraftKind;
+  params?: Record<string, unknown> | null;
+  result?: {
+    research_summary?: string;
+    sponsor?: unknown;
+    pitch_text?: string;
+    variants?: string[];
+    rationale?: unknown;
+    [k: string]: unknown;
+  } | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}

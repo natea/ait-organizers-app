@@ -7,6 +7,7 @@ import { byId, esc, fmt, num } from "../util";
 interface OverviewOpts {
   onOpenDetail: (meetupToken: string) => void;
   onOpenEmail: () => void;
+  onOpenSponsors: () => void;
   onOpenSettings: () => void;
 }
 
@@ -23,6 +24,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
       <span class="spacer"></span>
       <span class="sync"><span class="s-dot" id="syncDot"></span><span id="syncLabel">—</span></span>
       <button class="refresh" id="emailNavBtn">Email health</button>
+      <button class="refresh" id="sponsorsNavBtn">Sponsors</button>
       <button class="refresh" id="settingsNavBtn">Settings</button>
       <button class="refresh" id="refreshBtn">Refresh</button>
     </div>
@@ -49,6 +51,7 @@ export function mountOverview(opts: OverviewOpts): OverviewController {
   byId("tabUpcoming").addEventListener("click", () => setTab("upcoming"));
   byId("tabPast").addEventListener("click", () => setTab("past"));
   byId("emailNavBtn").addEventListener("click", () => opts.onOpenEmail());
+  byId("sponsorsNavBtn").addEventListener("click", () => opts.onOpenSponsors());
   byId("settingsNavBtn").addEventListener("click", () => opts.onOpenSettings());
 
   refreshBtn.addEventListener("click", async () => {
