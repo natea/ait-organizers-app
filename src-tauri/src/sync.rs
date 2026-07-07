@@ -1052,6 +1052,242 @@ pub fn update_tray(app: &AppHandle) {
     let _ = app.emit("popover:data", next.unwrap_or(Value::Null));
 }
 
+// ── Promotion tools (specs/promotion-tools) ────────────────────────────────
+// Generation calls are explicit user-initiated jobs, never on the poll loop
+// (design D1). Each kickoff runs on its own background task and reports
+// progress via `promotion:job` events, mirroring `sync:updated`.
+
+/// Freshness window for the cheap `logo_search` GET (not a billed generation).
+const LOGO_FRESHNESS_SECS: i64 = 600;
+
+fn hash_params(v: &Value) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    v.to_string().hash(&mut h);
+    format!("{:x}", h.finish())
+}
+
+fn new_job_id() -> String {
+    format!("{:x}{:x}", rand::random::<u64>(), rand::random::<u32>())
+}
+
+fn emit_promotion_job(
+    app: &AppHandle,
+    job_id: &str,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+    status: &str,
+    error_code: Option<&str>,
+) {
+    let _ = app.emit(
+        "promotion:job",
+        json!({
+            "job_id": job_id,
+            "meetup_token": meetup_token,
+            "kind": kind,
+            "platform": platform,
+            "status": status,
+            "error_code": error_code,
+        }),
+    );
+}
+
+/// Kick off (or, per design D7, return the id of an already in-flight) job for
+/// one promotion action. Returns immediately — the request itself runs on a
+/// spawned background task so the UI never blocks on the ~25s generation call.
+pub fn promotion_generate(
+    app: &AppHandle,
+    kind: String,
+    meetup_token: String,
+    platform: String,
+    params: Value,
+) -> AppResult<String> {
+    let state = app.state::<AppState>();
+    let now = iso_now();
+
+    if let Some(existing) = {
+        let conn = state.db.lock().unwrap();
+        db::find_active_promotion_job(&conn, &meetup_token, &kind, &platform)?
+    } {
+        return Ok(existing);
+    }
+
+    let id = new_job_id();
+    {
+        let conn = state.db.lock().unwrap();
+        db::create_promotion_job(
+            &conn,
+            &id,
+            &meetup_token,
+            &kind,
+            &platform,
+            &hash_params(&params),
+            &now,
+        )?;
+    }
+    emit_promotion_job(app, &id, &meetup_token, &kind, &platform, "pending", None);
+
+    let app2 = app.clone();
+    let (id2, meetup2, kind2, platform2) =
+        (id.clone(), meetup_token.clone(), kind.clone(), platform.clone());
+    let handle = tauri::async_runtime::spawn(async move {
+        run_promotion_job(app2, id2, meetup2, kind2, platform2, params).await;
+    });
+    state.promo_jobs.lock().unwrap().insert(id.clone(), handle);
+    Ok(id)
+}
+
+/// Abort an in-flight request (if still running) and drop the action back to
+/// its last cached draft by deleting the job row entirely (design D5).
+pub fn promotion_cancel(app: &AppHandle, job_id: &str) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    if let Some(handle) = state.promo_jobs.lock().unwrap().remove(job_id) {
+        handle.abort();
+    }
+    let job = {
+        let conn = state.db.lock().unwrap();
+        db::get_promotion_job(&conn, job_id)?
+    };
+    let Some(job) = job else { return Ok(()) };
+    let meetup_token = job.get("meetup_token").and_then(Value::as_str).unwrap_or_default().to_string();
+    let kind = job.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
+    let platform = job.get("platform").and_then(Value::as_str).unwrap_or_default().to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        db::delete_promotion_job(&conn, job_id)?;
+    }
+    emit_promotion_job(app, job_id, &meetup_token, &kind, &platform, "cancelled", None);
+    Ok(())
+}
+
+/// Run one generation request to completion (or timeout/error) on a spawned
+/// task, upsert the resulting draft on success, and emit progress events.
+async fn run_promotion_job(
+    app: AppHandle,
+    id: String,
+    meetup_token: String,
+    kind: String,
+    platform: String,
+    params: Value,
+) {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let _ = db::set_promotion_job_status(&conn, &id, "running", None);
+    }
+    emit_promotion_job(&app, &id, &meetup_token, &kind, &platform, "running", None);
+
+    let api = match client(&app) {
+        Ok(Some(api)) => api,
+        _ => {
+            finish_promotion_job(&app, &id, &meetup_token, &kind, &platform, "error", Some("no_key"));
+            app.state::<AppState>().promo_jobs.lock().unwrap().remove(&id);
+            return;
+        }
+    };
+
+    let backoff_key = format!("promo_{kind}");
+    let result: AppResult<crate::api::ApiOk> = match kind.as_str() {
+        "social_post" => {
+            let source_type = params.get("source_type").and_then(Value::as_str).unwrap_or("meetup");
+            let source_ref = params.get("source_ref").and_then(Value::as_str).unwrap_or(&meetup_token);
+            let goal = params.get("goal").and_then(Value::as_str).unwrap_or("promote");
+            let tone = params.get("tone").and_then(Value::as_str);
+            let city = params.get("city").and_then(Value::as_str);
+            api.social_post_generate(source_type, source_ref, &platform, goal, tone, city).await
+        }
+        "event_promo" => {
+            let package_type = params.get("package_type").and_then(Value::as_str).unwrap_or("full_campaign");
+            let audience = params.get("audience").and_then(Value::as_str).unwrap_or("general");
+            api.event_promo_generate(&meetup_token, package_type, audience).await
+        }
+        "discussion_topics" => api.discussion_topics_generate(&meetup_token).await,
+        other => Err(AppError::Other(format!("unknown promotion kind: {other}"))),
+    };
+
+    match result {
+        Ok(ok) => {
+            let now = iso_now();
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let _ = db::upsert_promotion_draft(&conn, &meetup_token, &kind, &platform, &params, &ok.data, &now);
+                let _ = db::set_promotion_job_status(&conn, &id, "ready", None);
+                record_rate_locked(&conn, &backoff_key, &ok.rate);
+            }
+            emit_promotion_job(&app, &id, &meetup_token, &kind, &platform, "ready", None);
+        }
+        Err(AppError::Timeout(_)) => {
+            finish_promotion_job(&app, &id, &meetup_token, &kind, &platform, "timeout", Some("timeout"));
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(&app, &backoff_key, parse_retry_after(&msg));
+            finish_promotion_job(&app, &id, &meetup_token, &kind, &platform, "error", Some("rate_limited"));
+        }
+        Err(e) => {
+            let code = e.code().to_string();
+            finish_promotion_job(&app, &id, &meetup_token, &kind, &platform, "error", Some(&code));
+        }
+    }
+    app.state::<AppState>().promo_jobs.lock().unwrap().remove(&id);
+}
+
+fn finish_promotion_job(
+    app: &AppHandle,
+    id: &str,
+    meetup_token: &str,
+    kind: &str,
+    platform: &str,
+    status: &str,
+    error_code: Option<&str>,
+) {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let _ = db::set_promotion_job_status(&conn, id, status, error_code);
+    }
+    emit_promotion_job(app, id, meetup_token, kind, platform, status, error_code);
+}
+
+/// Logo/brand asset search. A cheap GET, not a billed generation (design D3),
+/// so it's a plain cached command rather than a tracked job: read the cache
+/// within the freshness window, else fetch and upsert.
+pub async fn logo_search(
+    app: &AppHandle,
+    query: String,
+    scope: String,
+    include_co_branded: bool,
+    limit: u32,
+) -> AppResult<Value> {
+    let cached = {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        db::get_logo_cache(&conn, &query, &scope, include_co_branded)?
+    };
+    if let Some(row) = &cached {
+        let fresh = row
+            .get("fetched_at")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| Utc::now().signed_duration_since(t) < Duration::seconds(LOGO_FRESHNESS_SECS))
+            .unwrap_or(false);
+        if fresh {
+            return Ok(row.clone());
+        }
+    }
+
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    let ok = api.logo_search(&query, &scope, include_co_branded, limit).await?;
+    let now = iso_now();
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::upsert_logo_cache(&conn, &query, &scope, include_co_branded, &ok.data, &now)?;
+    record_rate_locked(&conn, "logo_search", &ok.rate);
+    Ok(json!({ "result": ok.data, "fetched_at": now }))
+}
+
 /// The soonest future event as a compact JSON payload for tray + popover.
 pub fn next_event_json(app: &AppHandle) -> Option<Value> {
     let state = app.state::<AppState>();

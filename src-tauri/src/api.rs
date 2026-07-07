@@ -1,9 +1,16 @@
+use std::time::Duration;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
 
 const BASE: &str = "https://aitinkerers.org/api/agents/v1";
+
+/// Client-side timeout for the four promotion generation endpoints. The
+/// server ceiling is ~25s (docs/agents-api.md); this sits above it and is
+/// distinct from the plain 6-8s implicit sync read timeout (design D5).
+const GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Rate-limit accounting captured from every response (background-sync pacing).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -39,47 +46,39 @@ impl ApiClient {
     /// sent only via the Authorization header, never in query or body
     /// (docs/agents-api.md auth rules).
     async fn call(&self, path: &str, body: Value) -> AppResult<ApiOk> {
+        self.call_timeout(path, body, None).await
+    }
+
+    /// POST with an explicit client-side timeout above the ~25s generation
+    /// ceiling (design D5, specs/promotion-tools) — distinct from the plain
+    /// `call` used by cheap sync reads.
+    async fn call_gen(&self, path: &str, body: Value) -> AppResult<ApiOk> {
+        self.call_timeout(path, body, Some(GENERATION_TIMEOUT)).await
+    }
+
+    async fn call_timeout(&self, path: &str, body: Value, timeout: Option<Duration>) -> AppResult<ApiOk> {
+        let url = format!("{BASE}/{path}");
+        let mut req = self.http.post(&url).bearer_auth(&self.key).json(&body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req.send().await?;
+        parse_envelope(resp).await
+    }
+
+    /// GET with query params (only `logo_search` uses this — a cheap read,
+    /// not a billed generation). The key is still sent only via the
+    /// Authorization header, never as a query param.
+    async fn call_get(&self, path: &str, query: &[(&str, String)]) -> AppResult<ApiOk> {
         let url = format!("{BASE}/{path}");
         let resp = self
             .http
-            .post(&url)
+            .get(&url)
             .bearer_auth(&self.key)
-            .json(&body)
+            .query(query)
             .send()
             .await?;
-
-        let status = resp.status();
-        let rate = read_rate(&resp);
-
-        if status.as_u16() == 429 {
-            // Encode Retry-After so the sync layer can honor it (specs/background-sync).
-            let secs = rate.retry_after.unwrap_or(0);
-            return Err(AppError::RateLimited(format!(
-                "Rate limited by the AI Tinkerers API; retry_after={secs}"
-            )));
-        }
-
-        let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text)
-            .map_err(|_| AppError::Network(format!("non-JSON response ({status})")))?;
-
-        if parsed.get("ok").and_then(Value::as_bool) == Some(true) {
-            let data = parsed.get("data").cloned().unwrap_or(Value::Null);
-            return Ok(ApiOk { data, rate });
-        }
-
-        // Error envelope: { ok:false, error:{ code, message } }
-        let err = parsed.get("error");
-        let code = err
-            .and_then(|e| e.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("other");
-        let message = err
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Request failed")
-            .to_string();
-        Err(AppError::from_api_code(code, message))
+        parse_envelope(resp).await
     }
 
     /// GET/POST auth/validate — returns owner identity, roles, enabled groups.
@@ -316,6 +315,118 @@ impl ApiClient {
         }
         self.call("analytics/email/fatigue_risk", body).await
     }
+
+    // ── Promotion tools (specs/promotion-tools) ────────────────────────────
+    // Agent-backed generation writes: slow (up to ~25s), tight rate limits, and
+    // never on the poll loop (design D1). Outputs are drafts only — no
+    // attendee-data mutation, no publishing.
+
+    /// Per-platform social post package (`social_post_generate`).
+    pub async fn social_post_generate(
+        &self,
+        source_type: &str,
+        source_ref: &str,
+        platform: &str,
+        goal: &str,
+        tone: Option<&str>,
+        city: Option<&str>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({
+            "source_type": source_type,
+            "source_ref": source_ref,
+            "platform": platform,
+            "goal": goal,
+        });
+        if let Some(t) = tone {
+            body["tone"] = json!(t);
+        }
+        if let Some(c) = city {
+            body["city"] = json!(c);
+        }
+        self.call_gen("social_posts/generate", body).await
+    }
+
+    /// Launch-ready event promo package (`event_promo_generate`).
+    pub async fn event_promo_generate(
+        &self,
+        meetup_token: &str,
+        package_type: &str,
+        audience: &str,
+    ) -> AppResult<ApiOk> {
+        self.call_gen(
+            "event_promos/generate",
+            json!({
+                "meetup_token": meetup_token,
+                "package_type": package_type,
+                "audience": audience,
+            }),
+        )
+        .await
+    }
+
+    /// Moderated discussion topics for a meetup (`discussion_topics_generate`).
+    pub async fn discussion_topics_generate(&self, meetup_token: &str) -> AppResult<ApiOk> {
+        self.call_gen(
+            "meetups/discussion_topics/generate",
+            json!({ "meetup_token": meetup_token }),
+        )
+        .await
+    }
+
+    /// Logo/brand asset search (`logo_search`) — a lightweight GET, not a
+    /// billed generation, so it uses the plain (untimed) request path.
+    pub async fn logo_search(
+        &self,
+        query: &str,
+        scope: &str,
+        include_co_branded: bool,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let q = [
+            ("query", query.to_string()),
+            ("scope", scope.to_string()),
+            ("include_co_branded", include_co_branded.to_string()),
+            ("limit", limit.to_string()),
+        ];
+        self.call_get("logos/search", &q).await
+    }
+}
+
+/// Shared envelope parsing for both POST and GET calls: 429 → `RateLimited`
+/// (carrying `retry_after` for the sync layer), `{ok:false, error}` → typed
+/// error, `{ok:true, data}` → unwrapped data + rate headers.
+async fn parse_envelope(resp: reqwest::Response) -> AppResult<ApiOk> {
+    let status = resp.status();
+    let rate = read_rate(&resp);
+
+    if status.as_u16() == 429 {
+        let secs = rate.retry_after.unwrap_or(0);
+        return Err(AppError::RateLimited(format!(
+            "Rate limited by the AI Tinkerers API; retry_after={secs}"
+        )));
+    }
+
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|_| AppError::Network(format!("non-JSON response ({status})")))?;
+
+    if parsed.get("ok").and_then(Value::as_bool) == Some(true) {
+        let data = parsed.get("data").cloned().unwrap_or(Value::Null);
+        return Ok(ApiOk { data, rate });
+    }
+
+    // Error envelope: { ok:false, error:{ code, message } }
+    let err = parsed.get("error");
+    let code = err
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("other");
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("Request failed")
+        .to_string();
+    Err(AppError::from_api_code(code, message))
 }
 
 fn read_rate(resp: &reqwest::Response) -> RateInfo {

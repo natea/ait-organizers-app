@@ -20,6 +20,9 @@ pub enum AppError {
     RateLimited(String),
     #[error("{0}")]
     NotFound(String),
+    /// Client-side request timeout (generation calls only — specs/promotion-tools D5).
+    #[error("{0}")]
+    Timeout(String),
     #[error("{0}")]
     Network(String),
     #[error("{0}")]
@@ -55,6 +58,7 @@ impl AppError {
             AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
             AppError::RateLimited(_) => "rate_limited",
             AppError::NotFound(_) => "not_found",
+            AppError::Timeout(_) => "timeout",
             AppError::Network(_) => "network",
             AppError::Keychain(_) => "keychain",
             AppError::Db(_) => "db",
@@ -80,7 +84,11 @@ impl From<rusqlite::Error> for AppError {
 
 impl From<reqwest::Error> for AppError {
     fn from(e: reqwest::Error) -> Self {
-        AppError::Network(e.to_string())
+        if e.is_timeout() {
+            AppError::Timeout(e.to_string())
+        } else {
+            AppError::Network(e.to_string())
+        }
     }
 }
 
