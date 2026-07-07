@@ -795,3 +795,274 @@ pub async fn checkin_commit(app: AppHandle, token: String, rsvp_ref: String, mee
     let queued = matches!(outcome, db::EnqueueOutcome::Enqueued);
     Ok(json!({ "row": row, "queued": queued }))
 }
+
+// ── Speaker review (specs/speaker-review) — reuses write_guard ─────────────
+// The app's third write path. Approve/decline/move-to-review and the
+// create/edit-proposal form both funnel through `rsvp_speaker_proposal_upsert`
+// (design: "Approval via speaker_proposal_upsert, not state_update") behind
+// the same prepare/commit confirmation gate as rsvp-screening and
+// attendance-checkin, and reuse the same `write_audit` table — no bespoke
+// audit log for this feature.
+
+const VALID_SPEAKER_STATUSES: [&str; 4] = ["pending_review", "main_stage", "science_fair", "sidelined"];
+
+fn validate_speaker_status(status: &str) -> AppResult<()> {
+    if VALID_SPEAKER_STATUSES.contains(&status) {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "invalid speaker_status '{status}' — must be one of {VALID_SPEAKER_STATUSES:?}"
+        )))
+    }
+}
+
+/// The exact-mutation payload a confirmation token is bound to. `meetup_token`
+/// is excluded, same rationale as `state_update_payload` — it's bookkeeping
+/// for the audit row and post-write refresh, not part of the mutation's identity.
+fn speaker_upsert_payload(
+    rsvp_ref: &str,
+    speaker_title: &str,
+    speaker_description: &str,
+    speaker_status: Option<&str>,
+    note: Option<&str>,
+) -> Value {
+    json!({
+        "action": "speaker_proposal_upsert",
+        "rsvp_ref": rsvp_ref,
+        "speaker_title": speaker_title,
+        "speaker_description": speaker_description,
+        "speaker_status": speaker_status,
+        "note": note,
+    })
+}
+
+/// Cached talk-proposal pipeline for one event, grouped into kanban lanes
+/// (fast path; no network).
+#[tauri::command]
+pub fn get_speaker_proposals(state: State<'_, AppState>, meetup_token: String) -> AppResult<Value> {
+    let conn = state.db.lock().unwrap();
+    db::get_speaker_proposals(&conn, &meetup_token)
+}
+
+/// Fetch + cache the talk-proposal pipeline for one event, then return it. An
+/// explicit screen-open/manual-refresh action — never the poll loop.
+#[tauri::command]
+pub async fn fetch_speaker_proposals(app: AppHandle, meetup_token: String) -> AppResult<Value> {
+    sync::fetch_speaker_proposals(&app, &meetup_token).await?;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_speaker_proposals(&conn, &meetup_token)
+}
+
+/// Cached ranked candidate pool for the resolved scope (fast path; no network).
+#[tauri::command]
+pub fn get_speaker_candidates(app: AppHandle, weblog_token: Option<String>) -> AppResult<Value> {
+    let scope = weblog_token.unwrap_or_else(|| sync::default_speaker_candidate_scope(&app));
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_speaker_candidates(&conn, &scope)
+}
+
+/// Fetch + cache the ranked candidate pool for the resolved scope. On a
+/// rate-limit/capability block the last-good cached candidates are returned
+/// unchanged, annotated with the degrade reason (task 3.2) — this command
+/// never bubbles that as a hard error since the panel is meant to degrade
+/// gracefully in place.
+#[tauri::command]
+pub async fn fetch_speaker_candidates(app: AppHandle, weblog_token: Option<String>) -> AppResult<Value> {
+    let scope = weblog_token
+        .clone()
+        .unwrap_or_else(|| sync::default_speaker_candidate_scope(&app));
+    let _ = sync::fetch_speaker_candidates(&app, weblog_token.as_deref()).await;
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::get_speaker_candidates(&conn, &scope)
+}
+
+/// Step 1 of the write guardrail for approve/decline/move-to-review: makes NO
+/// network call. Requires the RSVP already be cached (so `speaker_title`/
+/// `speaker_description` — required by the upstream endpoint — are available
+/// even though only the status is changing), and binds a confirmation token
+/// to the exact mutation.
+#[tauri::command]
+pub fn speaker_approval_prepare(
+    state: State<'_, AppState>,
+    rsvp_ref: String,
+    new_status: String,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_speaker_status(&new_status)?;
+    let conn = state.db.lock().unwrap();
+    let cached = db::get_speaker_proposal(&conn, &rsvp_ref)?
+        .ok_or_else(|| AppError::NotFound("proposal not cached — refresh the pipeline first".into()))?;
+    drop(conn);
+
+    let speaker_title = cached.get("speaker_title").and_then(Value::as_str).unwrap_or_default().to_string();
+    let speaker_description = cached.get("speaker_description").and_then(Value::as_str).unwrap_or_default().to_string();
+    let from_lane = cached.get("lane").and_then(Value::as_str).map(str::to_string);
+    let from_status = cached.get("speaker_approval_status").and_then(Value::as_str).map(str::to_string);
+
+    let payload = speaker_upsert_payload(&rsvp_ref, &speaker_title, &speaker_description, Some(&new_status), note.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "speaker_proposal_upsert",
+        "rsvp_ref": rsvp_ref,
+        "speaker_title": speaker_title,
+        "speaker_description": speaker_description,
+        "from_lane": from_lane,
+        "from_status": from_status,
+        "to_status": new_status,
+        "count": 1,
+    }))
+}
+
+/// Step 2: validate the token against the identical payload, write the
+/// `attempted` audit row, call the API (never with `send_speaker_email`/
+/// `send_rsvp_email` true), update the audit outcome after, and (on success)
+/// run the priority post-write `rsvp_get` refresh. On `forbidden_*`/
+/// `rate_limited` the mutation is aborted with no cache change beyond the
+/// audit row.
+#[tauri::command]
+pub async fn speaker_approval_commit(
+    app: AppHandle,
+    token: String,
+    meetup_token: String,
+    rsvp_ref: String,
+    new_status: String,
+    note: Option<String>,
+) -> AppResult<Value> {
+    validate_speaker_status(&new_status)?;
+    let app_state = app.state::<AppState>();
+    let (speaker_title, speaker_description, from_status) = {
+        let conn = app_state.db.lock().unwrap();
+        let cached = db::get_speaker_proposal(&conn, &rsvp_ref)?
+            .ok_or_else(|| AppError::NotFound("proposal not cached — refresh the pipeline first".into()))?;
+        (
+            cached.get("speaker_title").and_then(Value::as_str).unwrap_or_default().to_string(),
+            cached.get("speaker_description").and_then(Value::as_str).unwrap_or_default().to_string(),
+            cached.get("speaker_approval_status").and_then(Value::as_str).map(str::to_string),
+        )
+    };
+    let payload = speaker_upsert_payload(&rsvp_ref, &speaker_title, &speaker_description, Some(&new_status), note.as_deref());
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "speaker_proposal_upsert", Some(&meetup_token), &[rsvp_ref.clone()],
+            from_status.as_deref(), Some(&new_status), false, true, &now,
+        )?;
+    }
+
+    let result = sync::speaker_proposal_upsert(
+        &app, &meetup_token, &rsvp_ref, &speaker_title, &speaker_description, Some(&new_status), note.as_deref(),
+    )
+    .await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    let conn = app_state.db.lock().unwrap();
+    Ok(db::get_speaker_proposal(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
+}
+
+/// Step 1 of the write guardrail for creating/editing a proposal's
+/// title/description (with an optional status change alongside it). Falls
+/// back to empty title/description for a brand-new proposal on an RSVP with
+/// no cached proposal yet.
+#[tauri::command]
+pub fn speaker_proposal_prepare(
+    state: State<'_, AppState>,
+    rsvp_ref: String,
+    speaker_title: String,
+    speaker_description: String,
+    speaker_status: Option<String>,
+    note: Option<String>,
+) -> AppResult<Value> {
+    if let Some(s) = &speaker_status {
+        validate_speaker_status(s)?;
+    }
+    let conn = state.db.lock().unwrap();
+    let cached = db::get_speaker_proposal(&conn, &rsvp_ref)?;
+    drop(conn);
+    let from_lane = cached.as_ref().and_then(|c| c.get("lane").and_then(Value::as_str)).map(str::to_string);
+
+    let payload = speaker_upsert_payload(&rsvp_ref, &speaker_title, &speaker_description, speaker_status.as_deref(), note.as_deref());
+    let token = state.write_guard.prepare(&payload);
+    Ok(json!({
+        "token": token,
+        "action": "speaker_proposal_upsert",
+        "rsvp_ref": rsvp_ref,
+        "speaker_title": speaker_title,
+        "speaker_description": speaker_description,
+        "from_lane": from_lane,
+        "to_status": speaker_status,
+        "count": 1,
+    }))
+}
+
+/// Step 2: same token-validation gate as `speaker_approval_commit`, for the
+/// create/edit-proposal form.
+#[tauri::command]
+pub async fn speaker_proposal_commit(
+    app: AppHandle,
+    token: String,
+    meetup_token: String,
+    rsvp_ref: String,
+    speaker_title: String,
+    speaker_description: String,
+    speaker_status: Option<String>,
+    note: Option<String>,
+) -> AppResult<Value> {
+    if let Some(s) = &speaker_status {
+        validate_speaker_status(s)?;
+    }
+    let payload = speaker_upsert_payload(&rsvp_ref, &speaker_title, &speaker_description, speaker_status.as_deref(), note.as_deref());
+    let app_state = app.state::<AppState>();
+    app_state.write_guard.commit(&token, &payload)?;
+
+    let now = iso_now();
+    let from_status = {
+        let conn = app_state.db.lock().unwrap();
+        db::get_speaker_proposal(&conn, &rsvp_ref)?
+            .and_then(|c| c.get("speaker_approval_status").and_then(Value::as_str).map(str::to_string))
+    };
+    let audit_id = new_id();
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::insert_write_audit(
+            &conn, &audit_id, "speaker_proposal_upsert", Some(&meetup_token), &[rsvp_ref.clone()],
+            from_status.as_deref(), speaker_status.as_deref(), false, true, &now,
+        )?;
+    }
+
+    let result = sync::speaker_proposal_upsert(
+        &app, &meetup_token, &rsvp_ref, &speaker_title, &speaker_description, speaker_status.as_deref(), note.as_deref(),
+    )
+    .await;
+
+    let outcome_now = iso_now();
+    let (outcome, error_code) = match &result {
+        Ok(()) => ("ok".to_string(), None),
+        Err(e) => (e.code().to_string(), Some(e.code().to_string())),
+    };
+    {
+        let conn = app_state.db.lock().unwrap();
+        db::update_write_audit_outcome(&conn, &audit_id, &outcome, error_code.as_deref(), &outcome_now)?;
+    }
+    result?;
+
+    let conn = app_state.db.lock().unwrap();
+    Ok(db::get_speaker_proposal(&conn, &rsvp_ref)?.unwrap_or(Value::Null))
+}

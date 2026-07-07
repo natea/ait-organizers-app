@@ -596,6 +596,76 @@ impl ApiClient {
     pub async fn mark_attended(&self, rsvp_ref: &str) -> AppResult<ApiOk> {
         self.call("rsvps/mark_attended", json!({ "rsvp_ref": rsvp_ref })).await
     }
+
+    // ── Speaker review (specs/speaker-review) ──────────────────────────────
+    // The app's third write path, reusing the same write_guard prepare/commit
+    // gate as rsvp-screening and attendance-checkin. Approval status is set
+    // via `rsvp_speaker_proposal_upsert`'s `speaker_status` field — NOT via
+    // `rsvp_state_update`, which only changes the RSVP state (registered/
+    // attending/waitlisted/denied) and is the wrong tool for approval
+    // (design: "Approval via speaker_proposal_upsert, not state_update").
+
+    /// Ranked future-speaker candidate pool (`speaker_pipeline_candidates_get`,
+    /// GET, 15 rpm). Read-only recommendations — a distinct panel from the
+    /// review kanban, never a mutation input.
+    pub async fn speaker_pipeline_candidates_get(
+        &self,
+        weblog_token: Option<&str>,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut q = vec![("limit", limit.to_string())];
+        if let Some(t) = weblog_token {
+            q.push(("weblog_token", t.to_string()));
+        }
+        self.call_get("recommendations/speakers/pipeline", &q).await
+    }
+
+    /// Search speaker-tagged RSVPs (talk submissions) for one event, filtered
+    /// by `speaker_status` (submitted/pending_review/approved/sidelined/etc,
+    /// docs/agents-api.md). Separate from `rsvp_search` (rsvp-screening) since
+    /// that method has no speaker_status parameter and the two screens' sync
+    /// sweeps must not clobber each other's cached rows.
+    pub async fn rsvp_search_speakers(
+        &self,
+        meetup_token: &str,
+        speaker_status: &str,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        self.call(
+            "rsvps/search",
+            json!({ "meetup_token": meetup_token, "speaker_status": speaker_status, "limit": limit }),
+        )
+        .await
+    }
+
+    /// Create/update speaker proposal fields on an RSVP, optionally moving
+    /// `speaker_status` (approve -> `main_stage`, decline -> `sidelined`, move
+    /// to review -> `pending_review`). `send_speaker_email`/`send_rsvp_email`
+    /// are always explicitly pinned `false` here — there is no UI path in this
+    /// change that sets either true (spec: "Accidental email sends").
+    pub async fn rsvp_speaker_proposal_upsert(
+        &self,
+        rsvp_ref: &str,
+        speaker_title: &str,
+        speaker_description: &str,
+        speaker_status: Option<&str>,
+        note: Option<&str>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({
+            "rsvp_ref": rsvp_ref,
+            "speaker_title": speaker_title,
+            "speaker_description": speaker_description,
+            "send_speaker_email": false,
+            "send_rsvp_email": false,
+        });
+        if let Some(s) = speaker_status {
+            body["speaker_status"] = json!(s);
+        }
+        if let Some(n) = note {
+            body["note"] = json!(n);
+        }
+        self.call("rsvps/speaker_proposal_upsert", body).await
+    }
 }
 
 /// Hard cap on the serialized `context` payload for `sponsor_pitch_generate`

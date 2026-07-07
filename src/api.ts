@@ -24,6 +24,11 @@ import type {
   RsvpListResult,
   RsvpRow,
   RsvpWriteSettledEvent,
+  SpeakerCandidatesResult,
+  SpeakerConfirm,
+  SpeakerPipeline,
+  SpeakerProposal,
+  SpeakerWriteSettledEvent,
   SponsorContactsResult,
   SponsorDraft,
   SponsorDraftProgressEvent,
@@ -426,4 +431,99 @@ export function onCheckinQueueUpdated(cb: (e: CheckinQueueUpdatedEvent) => void)
  *  disable the check-in controls with an explanatory notice. */
 export function getCheckinDenials(meetupToken?: string): Promise<CheckinDenial[]> {
   return invoke("get_checkin_denials", { meetupToken: meetupToken ?? null });
+}
+
+// ── Speaker review (specs/speaker-review) ───────────────────────────────────
+// The kanban pipeline reads render from cache; approve/decline and the
+// create/edit-proposal form both go through the same two-step prepare/commit
+// gate as rsvp-screening and attendance-checkin.
+
+/** Cached talk-proposal pipeline for one event (fast path; no network). */
+export function getSpeakerProposals(meetupToken: string): Promise<SpeakerPipeline> {
+  return invoke("get_speaker_proposals", { meetupToken });
+}
+
+/** Fetch + cache the talk-proposal pipeline for one event, then return it. */
+export function fetchSpeakerProposals(meetupToken: string): Promise<SpeakerPipeline> {
+  return invoke("fetch_speaker_proposals", { meetupToken });
+}
+
+/** Cached ranked candidate pool for the resolved (or explicit) scope. */
+export function getSpeakerCandidates(weblogToken?: string): Promise<SpeakerCandidatesResult> {
+  return invoke("get_speaker_candidates", { weblogToken: weblogToken ?? null });
+}
+
+/** Fetch + cache the ranked candidate pool; degrades in place on 429/forbidden
+ *  rather than throwing (task 3.2) — the returned result carries `meta`. */
+export function fetchSpeakerCandidates(weblogToken?: string): Promise<SpeakerCandidatesResult> {
+  return invoke("fetch_speaker_candidates", { weblogToken: weblogToken ?? null });
+}
+
+/** Step 1: bind a confirmation token to an approve/decline/move-to-review action. */
+export function speakerApprovalPrepare(
+  rsvpRef: string,
+  newStatus: string,
+  note?: string,
+): Promise<SpeakerConfirm> {
+  return invoke("speaker_approval_prepare", { rsvpRef, newStatus, note: note ?? null });
+}
+
+/** Step 2: commit the confirmed approval/decline. Arguments must exactly
+ *  match what was passed to `speakerApprovalPrepare`, or the token is rejected. */
+export function speakerApprovalCommit(
+  token: string,
+  meetupToken: string,
+  rsvpRef: string,
+  newStatus: string,
+  note?: string,
+): Promise<SpeakerProposal> {
+  return invoke("speaker_approval_commit", { token, meetupToken, rsvpRef, newStatus, note: note ?? null });
+}
+
+/** Step 1: bind a confirmation token to a create/edit-proposal mutation. */
+export function speakerProposalPrepare(
+  rsvpRef: string,
+  speakerTitle: string,
+  speakerDescription: string,
+  speakerStatus?: string,
+  note?: string,
+): Promise<SpeakerConfirm> {
+  return invoke("speaker_proposal_prepare", {
+    rsvpRef,
+    speakerTitle,
+    speakerDescription,
+    speakerStatus: speakerStatus ?? null,
+    note: note ?? null,
+  });
+}
+
+/** Step 2: commit the confirmed create/edit-proposal mutation. */
+export function speakerProposalCommit(
+  token: string,
+  meetupToken: string,
+  rsvpRef: string,
+  speakerTitle: string,
+  speakerDescription: string,
+  speakerStatus?: string,
+  note?: string,
+): Promise<SpeakerProposal> {
+  return invoke("speaker_proposal_commit", {
+    token,
+    meetupToken,
+    rsvpRef,
+    speakerTitle,
+    speakerDescription,
+    speakerStatus: speakerStatus ?? null,
+    note: note ?? null,
+  });
+}
+
+/** Emitted after the priority post-write refresh settles the cache. */
+export function onSpeakerWriteSettled(cb: (e: SpeakerWriteSettledEvent) => void): Promise<UnlistenFn> {
+  return listen<SpeakerWriteSettledEvent>("speaker_write:settled", (e) => cb(e.payload));
+}
+
+/** Emitted after the talk-proposal pipeline finishes a background fetch. */
+export function onSpeakerPipelineUpdated(cb: (meetupToken: string) => void): Promise<UnlistenFn> {
+  return listen<{ meetup_token: string }>("speaker_pipeline:updated", (e) => cb(e.payload.meetup_token));
 }

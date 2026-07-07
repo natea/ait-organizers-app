@@ -8,6 +8,7 @@ import { mountDetail, type DetailController } from "./screens/detail";
 import { mountEmail, type EmailController } from "./screens/email";
 import { mountSponsors, type SponsorsController } from "./screens/sponsors";
 import { mountScreening, type ScreeningController } from "./screens/screening";
+import { mountSpeakers, type SpeakersController } from "./screens/speakers";
 import { mountCheckin, type CheckinController } from "./screens/checkin";
 import { mountSettings, type SettingsController } from "./screens/settings";
 
@@ -18,6 +19,7 @@ type ScreenId =
   | "scr-email"
   | "scr-sponsors"
   | "scr-screening"
+  | "scr-speakers"
   | "scr-checkin"
   | "scr-settings";
 
@@ -26,6 +28,7 @@ let detail: DetailController | null = null;
 let email: EmailController | null = null;
 let sponsors: SponsorsController | null = null;
 let screening: ScreeningController | null = null;
+let speakers: SpeakersController | null = null;
 let checkin: CheckinController | null = null;
 let settings: SettingsController | null = null;
 let currentDetailToken: string | null = null;
@@ -70,8 +73,23 @@ function enterApp(): void {
       show("scr-screening");
       void screening?.open(token, name);
     },
+    onOpenSpeakers: (token, name) => {
+      show("scr-speakers");
+      void speakers?.open(token, name);
+    },
   });
   screening = mountScreening({
+    onBack: () => {
+      if (currentDetailToken) {
+        show("scr-detail");
+        void detail?.refresh(currentDetailToken);
+      } else {
+        show("scr-overview");
+        overview?.reload();
+      }
+    },
+  });
+  speakers = mountSpeakers({
     onBack: () => {
       if (currentDetailToken) {
         show("scr-detail");

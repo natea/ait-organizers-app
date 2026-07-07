@@ -1609,3 +1609,88 @@ body.popover-body {
 .checkin-tap {
   min-width: 104px;
 }
+
+/* ── Speaker review (specs/speaker-review) ────────────────────────────────── */
+/* Reuses .panel, .not-enabled, .btn, .btn-ghost, .chip, .job-chip, .b-count,
+   .job-list/.job-row, .d-head, .rsvp-who, .page-body, .groups-note,
+   .confirm-overlay/.confirm-dialog/.confirm-body/.confirm-actions, and
+   .notice/.notice-err from the panels above — only the kanban grid, cards,
+   and the small inline forms are new. */
+
+.kanban-board {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+.kanban-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.kanban-col-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font: 700 13.5px/1 var(--sans);
+  color: var(--fg);
+}
+
+.kanban-col-body {
+  display: grid;
+  gap: 10px;
+}
+
+.kanban-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff;
+  display: grid;
+  gap: 6px;
+}
+
+.kanban-card-title {
+  font: 600 13.5px/1.35 var(--sans);
+  color: var(--fg);
+}
+
+.kanban-declined {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-row.dimmed {
+  opacity: 0.55;
+}
+
+.spk-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.spk-form input,
+.spk-form textarea {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: 400 13.5px/1.4 var(--sans);
+  color: var(--fg);
+  background: var(--bg);
+}
+
+.spk-form textarea {
+  resize: vertical;
+  font-family: var(--sans);
+}
+
+@media (max-width: 900px) {
+  .kanban-board {
+    grid-template-columns: 1fr;
+  }
+}

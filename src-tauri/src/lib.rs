@@ -127,6 +127,14 @@ pub fn run() {
             commands::get_checkin_denials,
             commands::checkin_prepare,
             commands::checkin_commit,
+            commands::get_speaker_proposals,
+            commands::fetch_speaker_proposals,
+            commands::get_speaker_candidates,
+            commands::fetch_speaker_candidates,
+            commands::speaker_approval_prepare,
+            commands::speaker_approval_commit,
+            commands::speaker_proposal_prepare,
+            commands::speaker_proposal_commit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
