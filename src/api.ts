@@ -9,6 +9,7 @@ import type {
   EventsPayload,
   Identity,
   NextEvent,
+  SurveyFollowup,
   Throughput,
 } from "./types";
 
@@ -65,6 +66,18 @@ export function getChapterDeliverability(): Promise<ChapterDeliverability> {
 /** Trigger a manual email fetch: an event's send data, or (no token) the chapter. */
 export function refreshEmail(meetupToken?: string): Promise<void> {
   return invoke("refresh_email", { meetupToken: meetupToken ?? null });
+}
+
+// ── Survey + follow-up (specs/survey-followup) ─────────────────────────────
+
+/** Cached-only read (no network) — used for background re-render. */
+export function getSurveyFollowup(meetupToken: string): Promise<SurveyFollowup | null> {
+  return invoke("get_survey_followup", { meetupToken });
+}
+
+/** Fetch on detail open / manual refresh; only meaningful for past events. */
+export function fetchSurveyFollowup(meetupToken: string): Promise<SurveyFollowup | null> {
+  return invoke("fetch_survey_followup", { meetupToken });
 }
 
 export function setNotificationsEnabled(enabled: boolean): Promise<void> {

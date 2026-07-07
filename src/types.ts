@@ -276,6 +276,55 @@ export interface ChapterDeliverability {
   updated_at?: string | null;
 }
 
+// ── Survey + follow-up (specs/survey-followup) ─────────────────────────────
+// Post-event survey coverage + follow-up email engagement for a past event.
+// Fields optional/loose because live shapes were unverifiable; the Rust cache
+// parses defensively and derives the response rate itself.
+
+export type SourceStatus =
+  | "ok"
+  | "empty"
+  | "forbidden_api_group"
+  | "forbidden_scope"
+  | "forbidden_role"
+  | "unavailable";
+
+export interface SurveyFollowupSurvey {
+  eligible_attendees?: number | null;
+  response_count?: number | null;
+  // Derived server-side; null when the denominator is zero/unknown (never a
+  // fabricated 0%).
+  response_rate?: number | null;
+  survey_email_sent?: number | null;
+  survey_email_opened?: number | null;
+  // Only present when the API payload actually carries aggregate tallies —
+  // never synthesized from counts.
+  sentiment?: unknown;
+  themes?: unknown;
+  report_row_found?: boolean;
+  [k: string]: unknown;
+}
+
+export interface SurveyFollowupEmail {
+  sends?: number | null;
+  delivered?: number | null;
+  opens?: number | null;
+  clicks?: number | null;
+  open_rate?: number | null;
+  click_rate?: number | null;
+  campaign_count?: number;
+  [k: string]: unknown;
+}
+
+export interface SurveyFollowup {
+  meetup_token: string;
+  survey?: SurveyFollowupSurvey | null;
+  survey_status: SourceStatus;
+  email?: SurveyFollowupEmail | null;
+  email_status: SourceStatus;
+  updated_at?: string | null;
+}
+
 // Typed error surfaced from Rust (error envelope code + message).
 export interface AppErr {
   code: string;

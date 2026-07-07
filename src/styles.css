@@ -789,6 +789,35 @@ body {
   color: var(--accent);
 }
 
+/* Survey + follow-up panel (specs/survey-followup) — reuses .email-stats,
+   .stat-tile, .ep-title, .not-enabled from the panels above. */
+.sf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 18px;
+}
+.sf-section .ep-title {
+  margin-top: 0;
+}
+.theme-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.theme-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(61, 83, 194, 0.09);
+  color: var(--accent);
+  font: 600 11.5px/1.4 var(--sans);
+}
+.theme-chip.sentiment {
+  background: rgba(61, 83, 194, 0.16);
+}
+
 /* Send-job status chips */
 .job-chip {
   display: inline-flex;

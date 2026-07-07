@@ -88,6 +88,8 @@ pub fn run() {
             commands::get_event_email,
             commands::get_send_job_throughput,
             commands::get_chapter_deliverability,
+            commands::get_survey_followup,
+            commands::fetch_survey_followup,
             commands::refresh_email,
             commands::refresh_now,
             commands::get_next_event,
