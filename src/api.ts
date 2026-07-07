@@ -13,6 +13,10 @@ import type {
   PromotionDraft,
   PromotionDraftMap,
   PromotionJobEvent,
+  SponsorContactsResult,
+  SponsorDraft,
+  SponsorDraftProgressEvent,
+  SponsorSearchResult,
   SurveyFollowup,
   Throughput,
 } from "./types";
@@ -176,4 +180,91 @@ export function logoSearch(
 /** Progress events for tracked generation jobs (design D2). */
 export function onPromotionJob(cb: (e: PromotionJobEvent) => void): Promise<UnlistenFn> {
   return listen<PromotionJobEvent>("promotion:job", (e) => cb(e.payload));
+}
+
+// ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────────
+
+/** Search sponsors (fetch + cache) and return the cached result page. */
+export function sponsorSearch(
+  query: string,
+  city?: string,
+  industry?: string,
+  activeOnly?: boolean,
+): Promise<SponsorSearchResult> {
+  return invoke("sponsor_search", {
+    query,
+    city: city || null,
+    industry: industry || null,
+    activeOnly: activeOnly ?? null,
+  });
+}
+
+/** Cache-only read of one sponsor's contacts (no network). */
+export function getSponsorContacts(sponsorRef: string): Promise<SponsorContactsResult> {
+  return invoke("get_sponsor_contacts", { sponsorRef });
+}
+
+/** Fetch + cache contacts for one sponsor (explicit action on selection). */
+export function sponsorContactsGet(sponsorRef: string): Promise<SponsorContactsResult> {
+  return invoke("sponsor_contacts_get", { sponsorRef });
+}
+
+export interface SponsorGenerateParams {
+  sponsorRef?: string;
+  name?: string;
+  domain?: string;
+  city?: string;
+  channel?: string;
+  targetAudience?: string;
+  meetupToken?: string;
+  notes?: string;
+}
+
+/** Kick off (or, if one is already in flight, return the id of) a research or
+ *  pitch generation job. `kind` is "research" or "pitch". */
+export function sponsorGenerate(kind: "research" | "pitch", params: SponsorGenerateParams): Promise<string> {
+  return invoke("sponsor_generate", {
+    kind,
+    sponsorRef: params.sponsorRef ?? null,
+    name: params.name ?? null,
+    domain: params.domain ?? null,
+    city: params.city ?? null,
+    channel: params.channel ?? null,
+    targetAudience: params.targetAudience ?? null,
+    meetupToken: params.meetupToken ?? null,
+    notes: params.notes ?? null,
+  });
+}
+
+/** Cancel an in-flight sponsor generation job; falls back to cached drafts. */
+export function sponsorGenerationCancel(jobId: string): Promise<void> {
+  return invoke("sponsor_generation_cancel", { jobId });
+}
+
+/** All cached drafts for one subject (sponsor_token or free-text name),
+ *  newest first; `kind` narrows to "research" or "pitch". */
+export function getSponsorDrafts(
+  subject: { sponsorRef?: string; name?: string },
+  kind?: "research" | "pitch",
+): Promise<SponsorDraft[]> {
+  return invoke("get_sponsor_drafts", {
+    sponsorRef: subject.sponsorRef ?? null,
+    name: subject.name ?? null,
+    kind: kind ?? null,
+  });
+}
+
+/** One cached draft by id, if any. */
+export function getSponsorDraft(draftId: string): Promise<SponsorDraft | null> {
+  return invoke("get_sponsor_draft", { draftId });
+}
+
+/** Current state of one sponsor generation job (in case an event was missed). */
+export function getSponsorJob(jobId: string): Promise<Record<string, unknown> | null> {
+  return invoke("get_sponsor_job", { jobId });
+}
+
+/** Progress events for tracked sponsor research/pitch generation jobs. */
+export function onSponsorDraftProgress(cb: (e: SponsorDraftProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<SponsorDraftProgressEvent>("sponsor_draft_progress", (e) => cb(e.payload));
 }

@@ -390,6 +390,142 @@ impl ApiClient {
         ];
         self.call_get("logos/search", &q).await
     }
+
+    // ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────
+    // Gated by `subscribers_sponsors` + city-owner scope. Search and contact
+    // list are cheap GET reads (30/20 rpm); research/pitch are generation
+    // calls sharing the same 20s hard-timeout tier as promotion tools
+    // (`call_gen`), never on the poll loop, always an explicit user kickoff.
+
+    /// Search sponsors by name/industry/city (`sponsor_search`, GET, 30 rpm).
+    pub async fn sponsor_search(
+        &self,
+        query: &str,
+        city: Option<&str>,
+        industry: Option<&str>,
+        active_only: bool,
+        limit: u32,
+    ) -> AppResult<ApiOk> {
+        let mut q = vec![
+            ("query", query.to_string()),
+            ("limit", limit.to_string()),
+            ("active_only", active_only.to_string()),
+        ];
+        if let Some(c) = city {
+            q.push(("city", c.to_string()));
+        }
+        if let Some(i) = industry {
+            q.push(("industry", i.to_string()));
+        }
+        self.call_get("sponsors/search", &q).await
+    }
+
+    /// Contacts for one sponsor (`sponsor_contact_list`, GET, 20 rpm). Email/
+    /// phone masking is applied server-side — the client never unmasks.
+    pub async fn sponsor_contact_list(&self, sponsor_ref: &str) -> AppResult<ApiOk> {
+        self.call_get("sponsors/contacts", &[("sponsor_ref", sponsor_ref.to_string())])
+            .await
+    }
+
+    /// AI research brief for a sponsor or free-text company (`sponsor_research_generate`,
+    /// POST, 10 rpm, 20s hard timeout).
+    pub async fn sponsor_research_generate(
+        &self,
+        sponsor_ref: Option<&str>,
+        name: Option<&str>,
+        domain: Option<&str>,
+        city: Option<&str>,
+        target_audience: Option<&str>,
+        context: Option<&Value>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({});
+        if let Some(v) = sponsor_ref {
+            body["sponsor_ref"] = json!(v);
+        }
+        if let Some(v) = name {
+            body["name"] = json!(v);
+        }
+        if let Some(v) = domain {
+            body["domain"] = json!(v);
+        }
+        if let Some(v) = city {
+            body["city"] = json!(v);
+        }
+        if let Some(v) = target_audience {
+            body["target_audience"] = json!(v);
+        }
+        if let Some(v) = context {
+            body["context"] = v.clone();
+        }
+        self.call_gen("sponsors/research_generate", body).await
+    }
+
+    /// Tailored sponsorship pitch with event context (`sponsor_pitch_generate`,
+    /// POST, 10 rpm, 20s hard timeout). The `context` payload is capped at
+    /// 64 KB before send (design D2/spec) — see `cap_pitch_context_size`.
+    pub async fn sponsor_pitch_generate(
+        &self,
+        sponsor_ref: Option<&str>,
+        name: Option<&str>,
+        city: Option<&str>,
+        channel: Option<&str>,
+        target_audience: Option<&str>,
+        context: Option<&Value>,
+    ) -> AppResult<ApiOk> {
+        let mut body = json!({});
+        if let Some(v) = sponsor_ref {
+            body["sponsor_ref"] = json!(v);
+        }
+        if let Some(v) = name {
+            body["name"] = json!(v);
+        }
+        if let Some(v) = city {
+            body["city"] = json!(v);
+        }
+        if let Some(v) = channel {
+            body["channel"] = json!(v);
+        }
+        if let Some(v) = target_audience {
+            body["target_audience"] = json!(v);
+        }
+        if let Some(v) = context {
+            body["context"] = v.clone();
+        }
+        body = cap_pitch_context_size(body, PITCH_CONTEXT_CAP_BYTES);
+        self.call_gen("sponsors/pitch_generate", body).await
+    }
+}
+
+/// Hard cap on the serialized `context` payload for `sponsor_pitch_generate`
+/// (spec: "MUST stay within the API's 64 KB context cap"). This is the
+/// last-resort safety net; `sync::build_pitch_context` already assembles a
+/// small summary-only payload, so this should rarely trigger.
+const PITCH_CONTEXT_CAP_BYTES: usize = 64 * 1024;
+
+fn cap_pitch_context_size(mut body: Value, cap: usize) -> Value {
+    if body.to_string().len() <= cap {
+        return body;
+    }
+    if let Some(Value::Object(ctx)) = body.get_mut("context") {
+        ctx.remove("notes");
+    }
+    if body.to_string().len() <= cap {
+        return body;
+    }
+    if let Some(Value::Object(ctx)) = body.get_mut("context") {
+        if let Some(Value::Object(ev)) = ctx.get_mut("event") {
+            ev.retain(|k, _| k == "name" || k == "city");
+        }
+    }
+    if body.to_string().len() <= cap {
+        return body;
+    }
+    // Still oversized (unexpectedly large caller-supplied context) — drop it
+    // entirely rather than exceed the cap.
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("context");
+    }
+    body
 }
 
 /// Shared envelope parsing for both POST and GET calls: 429 → `RateLimited`

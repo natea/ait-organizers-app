@@ -28,6 +28,11 @@ pub struct AppState {
     /// `promotion_cancel` can abort the background request (specs/promotion-tools,
     /// design D5). Entries are removed once the task finishes or is cancelled.
     pub promo_jobs: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
+    /// In-flight sponsor research/pitch generation tasks, keyed by job id
+    /// (specs/sponsor-tools) — the same cancellable-job pattern as
+    /// `promo_jobs`, kept as a separate registry since the two features have
+    /// independent job tables and id spaces.
+    pub sponsor_jobs: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -39,6 +44,7 @@ impl AppState {
             notifications_enabled: AtomicBool::new(true),
             syncing: AtomicBool::new(false),
             promo_jobs: Mutex::new(HashMap::new()),
+            sponsor_jobs: Mutex::new(HashMap::new()),
         }
     }
 

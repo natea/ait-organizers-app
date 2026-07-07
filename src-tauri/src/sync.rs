@@ -1288,6 +1288,342 @@ pub async fn logo_search(
     Ok(json!({ "result": ok.data, "fetched_at": now }))
 }
 
+// ── Sponsor tools (specs/sponsor-tools) ────────────────────────────────────
+// Search + contacts are explicit-action cached reads (never the poll loop);
+// research/pitch are generation kickoffs mirroring promotion tools (design D2)
+// but tracked in their own job/draft tables (state.rs sponsor_jobs).
+
+fn sponsor_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        AppError::RateLimited(_) => "rate_limited",
+        _ => "unavailable",
+    }
+}
+
+/// Search sponsors, cache matches + this query's result list, and return the
+/// cached view. Degrade states (`forbidden_api_group`/`forbidden_scope`/rate
+/// limit) are stored on the search-cache row rather than bubbled as an error,
+/// so the Sponsors screen can render an informative disabled state (task 3.6).
+pub async fn sponsor_search(
+    app: &AppHandle,
+    query: String,
+    city: Option<String>,
+    industry: Option<String>,
+    active_only: bool,
+) -> AppResult<Value> {
+    let city = city.unwrap_or_default();
+    let industry = industry.unwrap_or_default();
+    let now = iso_now();
+
+    let Some(api) = client(app)? else {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        return db::get_sponsor_search(&conn, &query, &city, &industry, active_only);
+    };
+
+    match api
+        .sponsor_search(&query, Some(&city).filter(|s| !s.is_empty()).map(String::as_str), Some(&industry).filter(|s| !s.is_empty()).map(String::as_str), active_only, 25)
+        .await
+    {
+        Ok(ok) => {
+            let matches = ok.data.get("matches").and_then(Value::as_array).cloned().unwrap_or_default();
+            let truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(matches.len() >= 25);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_search(&conn, &query, &city, &industry, active_only, &matches, truncated, false, None, &now)?;
+            record_rate_locked(&conn, "sponsor_search", &ok.rate);
+            db::get_sponsor_search(&conn, &query, &city, &industry, active_only)
+        }
+        Err(e) if e.is_capability_block() => {
+            let code = sponsor_error_code(&e);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_search(&conn, &query, &city, &industry, active_only, &[], false, true, Some(code), &now)?;
+            db::get_sponsor_search(&conn, &query, &city, &industry, active_only)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, "sponsor_search", parse_retry_after(&msg));
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_search(&conn, &query, &city, &industry, active_only, &[], false, true, Some("rate_limited"), &now)?;
+            db::get_sponsor_search(&conn, &query, &city, &industry, active_only)
+        }
+        Err(_) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::get_sponsor_search(&conn, &query, &city, &industry, active_only)
+        }
+    }
+}
+
+/// Fetch + cache contacts for one sponsor, replacing the whole set, and
+/// return the cached view. Same degrade-on-row philosophy as `sponsor_search`.
+pub async fn sponsor_contacts_get(app: &AppHandle, sponsor_ref: String) -> AppResult<Value> {
+    let now = iso_now();
+    let Some(api) = client(app)? else {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        return db::get_sponsor_contacts(&conn, &sponsor_ref);
+    };
+
+    match api.sponsor_contact_list(&sponsor_ref).await {
+        Ok(ok) => {
+            let contacts = ok.data.get("contacts").and_then(Value::as_array).cloned().unwrap_or_default();
+            let truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(contacts.len() >= 25);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_contacts(&conn, &sponsor_ref, &contacts, truncated, false, None, &now)?;
+            record_rate_locked(&conn, "sponsor_contacts", &ok.rate);
+            db::get_sponsor_contacts(&conn, &sponsor_ref)
+        }
+        Err(e) if e.is_capability_block() => {
+            let code = sponsor_error_code(&e);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_contacts(&conn, &sponsor_ref, &[], false, true, Some(code), &now)?;
+            db::get_sponsor_contacts(&conn, &sponsor_ref)
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, "sponsor_contacts", parse_retry_after(&msg));
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::upsert_sponsor_contacts(&conn, &sponsor_ref, &[], false, true, Some("rate_limited"), &now)?;
+            db::get_sponsor_contacts(&conn, &sponsor_ref)
+        }
+        Err(_) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::get_sponsor_contacts(&conn, &sponsor_ref)
+        }
+    }
+}
+
+/// Assemble a small, capped event-context object for a sponsor pitch from the
+/// already-cached events data (design D2/task 3.5) — only summary fields, so
+/// the request body comfortably stays under the 64 KB cap even before the
+/// last-resort trim in `api::sponsor_pitch_generate`.
+fn build_gen_context(app: &AppHandle, meetup_token: Option<&str>, notes: Option<&str>) -> Option<Value> {
+    let mut ctx = serde_json::Map::new();
+    if let Some(mt) = meetup_token {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        if let Ok(Some(ev)) = db::get_event_detail(&conn, mt) {
+            let rsvps = ev.get("rsvps").cloned().unwrap_or(Value::Null);
+            ctx.insert(
+                "event".into(),
+                json!({
+                    "meetup_token": mt,
+                    "name": ev.get("event_name"),
+                    "city": ev.get("city"),
+                    "starts_at_local": ev.get("starts_at_local"),
+                    "event_url": ev.get("event_url"),
+                    "attending": rsvps.get("attending"),
+                    "capacity": rsvps.get("capacity"),
+                }),
+            );
+        }
+    }
+    if let Some(n) = notes {
+        let trimmed: String = n.chars().take(4000).collect();
+        if !trimmed.is_empty() {
+            ctx.insert("notes".into(), json!(trimmed));
+        }
+    }
+    if ctx.is_empty() {
+        None
+    } else {
+        Some(Value::Object(ctx))
+    }
+}
+
+fn emit_sponsor_job(
+    app: &AppHandle,
+    job_id: &str,
+    subject: &str,
+    kind: &str,
+    status: &str,
+    error_code: Option<&str>,
+    draft_id: Option<&str>,
+) {
+    let _ = app.emit(
+        "sponsor_draft_progress",
+        json!({
+            "job_id": job_id,
+            "subject": subject,
+            "kind": kind,
+            "status": status,
+            "error_code": error_code,
+            "draft_id": draft_id,
+        }),
+    );
+}
+
+/// Parameters for one research/pitch generation kickoff.
+#[derive(Clone)]
+pub struct SponsorGenParams {
+    pub sponsor_ref: Option<String>,
+    pub name: Option<String>,
+    pub domain: Option<String>,
+    pub city: Option<String>,
+    pub channel: Option<String>,
+    pub target_audience: Option<String>,
+    pub meetup_token: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Kick off (or, if one is already in-flight for this subject+kind, return the
+/// id of) a research or pitch generation job. Returns immediately — the
+/// request itself runs on a spawned background task so the UI never blocks on
+/// the ~20s generation call (spec: "Asynchronous generation with progress and
+/// cancel").
+pub fn sponsor_generate(app: &AppHandle, kind: String, params: SponsorGenParams) -> AppResult<String> {
+    let subject = db::sponsor_subject_key(params.sponsor_ref.as_deref(), params.name.as_deref());
+    let state = app.state::<AppState>();
+    let now = iso_now();
+
+    if let Some(existing) = {
+        let conn = state.db.lock().unwrap();
+        db::find_active_sponsor_job(&conn, &subject, &kind)?
+    } {
+        return Ok(existing);
+    }
+
+    let id = new_job_id();
+    let hash = hash_params(&json!({
+        "sponsor_ref": params.sponsor_ref, "name": params.name, "domain": params.domain,
+        "city": params.city, "channel": params.channel, "target_audience": params.target_audience,
+        "meetup_token": params.meetup_token, "notes": params.notes,
+    }));
+    {
+        let conn = state.db.lock().unwrap();
+        db::create_sponsor_job(&conn, &id, &subject, params.sponsor_ref.as_deref(), params.name.as_deref(), &kind, &hash, &now)?;
+    }
+    emit_sponsor_job(app, &id, &subject, &kind, "pending", None, None);
+
+    let app2 = app.clone();
+    let (id2, subject2, kind2) = (id.clone(), subject.clone(), kind.clone());
+    let handle = tauri::async_runtime::spawn(async move {
+        run_sponsor_job(app2, id2, subject2, kind2, params).await;
+    });
+    state.sponsor_jobs.lock().unwrap().insert(id.clone(), handle);
+    Ok(id)
+}
+
+/// Abort an in-flight request (if still running) and drop the job row — the
+/// action falls back to its cached drafts, and no partial draft is written.
+pub fn sponsor_generation_cancel(app: &AppHandle, job_id: &str) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    if let Some(handle) = state.sponsor_jobs.lock().unwrap().remove(job_id) {
+        handle.abort();
+    }
+    let job = {
+        let conn = state.db.lock().unwrap();
+        db::get_sponsor_job(&conn, job_id)?
+    };
+    let Some(job) = job else { return Ok(()) };
+    let subject = job.get("subject").and_then(Value::as_str).unwrap_or_default().to_string();
+    let kind = job.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
+    {
+        let conn = state.db.lock().unwrap();
+        db::delete_sponsor_job(&conn, job_id)?;
+    }
+    emit_sponsor_job(app, job_id, &subject, &kind, "cancelled", None, None);
+    Ok(())
+}
+
+async fn run_sponsor_job(app: AppHandle, id: String, subject: String, kind: String, params: SponsorGenParams) {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let _ = db::set_sponsor_job_status(&conn, &id, "running", None, None);
+    }
+    emit_sponsor_job(&app, &id, &subject, &kind, "running", None, None);
+
+    let api = match client(&app) {
+        Ok(Some(api)) => api,
+        _ => {
+            finish_sponsor_job(&app, &id, &subject, &kind, "error", Some("no_key"));
+            app.state::<AppState>().sponsor_jobs.lock().unwrap().remove(&id);
+            return;
+        }
+    };
+
+    let backoff_key = format!("sponsor_{kind}");
+    let result: AppResult<crate::api::ApiOk> = match kind.as_str() {
+        "research" => {
+            api.sponsor_research_generate(
+                params.sponsor_ref.as_deref(),
+                params.name.as_deref(),
+                params.domain.as_deref(),
+                params.city.as_deref(),
+                params.target_audience.as_deref(),
+                build_gen_context(&app, None, params.notes.as_deref()).as_ref(),
+            )
+            .await
+        }
+        "pitch" => {
+            let context = build_gen_context(&app, params.meetup_token.as_deref(), params.notes.as_deref());
+            api.sponsor_pitch_generate(
+                params.sponsor_ref.as_deref(),
+                params.name.as_deref(),
+                params.city.as_deref(),
+                params.channel.as_deref(),
+                params.target_audience.as_deref(),
+                context.as_ref(),
+            )
+            .await
+        }
+        other => Err(AppError::Other(format!("unknown sponsor generation kind: {other}"))),
+    };
+
+    match result {
+        Ok(ok) => {
+            let now = iso_now();
+            let draft_id = new_job_id();
+            let params_json = json!({
+                "sponsor_ref": params.sponsor_ref, "name": params.name, "domain": params.domain,
+                "city": params.city, "channel": params.channel, "target_audience": params.target_audience,
+                "meetup_token": params.meetup_token,
+            });
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                let _ = db::insert_sponsor_draft(
+                    &conn, &draft_id, &subject, params.sponsor_ref.as_deref(), params.name.as_deref(),
+                    &kind, &params_json, &ok.data, &now,
+                );
+                let _ = db::set_sponsor_job_status(&conn, &id, "ready", None, Some(&draft_id));
+                record_rate_locked(&conn, &backoff_key, &ok.rate);
+            }
+            emit_sponsor_job(&app, &id, &subject, &kind, "ready", None, Some(&draft_id));
+        }
+        Err(AppError::Timeout(_)) => {
+            finish_sponsor_job(&app, &id, &subject, &kind, "timeout", Some("timeout"));
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(&app, &backoff_key, parse_retry_after(&msg));
+            finish_sponsor_job(&app, &id, &subject, &kind, "error", Some("rate_limited"));
+        }
+        Err(e) => {
+            let code = e.code().to_string();
+            finish_sponsor_job(&app, &id, &subject, &kind, "error", Some(&code));
+        }
+    }
+    app.state::<AppState>().sponsor_jobs.lock().unwrap().remove(&id);
+}
+
+fn finish_sponsor_job(app: &AppHandle, id: &str, subject: &str, kind: &str, status: &str, error_code: Option<&str>) {
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        let _ = db::set_sponsor_job_status(&conn, id, status, error_code, None);
+    }
+    emit_sponsor_job(app, id, subject, kind, status, error_code, None);
+}
+
 /// The soonest future event as a compact JSON payload for tray + popover.
 pub fn next_event_json(app: &AppHandle) -> Option<Value> {
     let state = app.state::<AppState>();
