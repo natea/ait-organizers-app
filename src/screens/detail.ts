@@ -41,6 +41,7 @@ const ACTIVE_POLL_MS = 60_000;
 interface DetailOpts {
   onBack: () => void;
   onOpenScreening: (meetupToken: string, eventName: string) => void;
+  onOpenSpeakers: (meetupToken: string, eventName: string) => void;
 }
 
 export interface DetailController {
@@ -190,6 +191,9 @@ export function mountDetail(opts: DetailOpts): DetailController {
     document.getElementById("screenAttendeesBtn")?.addEventListener("click", () => {
       opts.onOpenScreening(ev.meetup_token, ev.event_name);
     });
+    document.getElementById("speakerPipelineBtn")?.addEventListener("click", () => {
+      opts.onOpenSpeakers(ev.meetup_token, ev.event_name);
+    });
     paintEmail();
     paintSurveyFollowup();
     promote.paint();
@@ -272,6 +276,7 @@ function bodyHTML(ev: EventObj): string {
       </div>
       <div class="d-head-actions">
         <button class="btn-ghost" id="screenAttendeesBtn">Screen attendees</button>
+        <button class="btn-ghost" id="speakerPipelineBtn">Speaker pipeline</button>
         ${chip}
       </div>
     </div>

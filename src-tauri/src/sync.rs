@@ -2087,3 +2087,195 @@ pub fn checkin_progress(app: &AppHandle, meetup_token: &str) -> Value {
         "pending": pending,
     })
 }
+
+// ── Speaker review (specs/speaker-review) ───────────────────────────────────
+// The app's third write path. Reads (proposal pipeline, candidate pool)
+// degrade non-blockingly on a capability block, same posture as
+// fetch_rsvp_list. The write (`rsvp_speaker_proposal_upsert`) is called ONLY
+// from `commands::speaker_*_commit` after the write_guard token has already
+// been validated, and never auto-retries on 429 (design: reuses the shared
+// guardrail's no-auto-retry posture).
+
+const SPEAKER_PIPELINE_KEY: &str = "speaker_pipeline";
+const SPEAKER_CANDIDATES_KEY: &str = "speaker_candidates";
+const SPEAKER_WRITE_KEY: &str = "speaker_write";
+const SPEAKER_SEARCH_LIMIT: u32 = 50;
+
+fn speaker_error_code(e: &AppError) -> &'static str {
+    match e {
+        AppError::ForbiddenApiGroup(_) => "forbidden_api_group",
+        AppError::ForbiddenScope(_) => "forbidden_scope",
+        AppError::ForbiddenRole(_) => "forbidden_role",
+        AppError::RateLimited(_) => "rate_limited",
+        _ => "unavailable",
+    }
+}
+
+/// Fetch + cache the talk-proposal pipeline for one event (task 3.1),
+/// sweeping every `speaker_status` the kanban cares about. Degrades
+/// non-blockingly on a capability block (previously-cached rows are left in
+/// place, same "degrade, don't erase" posture as `fetch_rsvp_list`).
+pub async fn fetch_speaker_proposals(app: &AppHandle, meetup_token: &str) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    if in_backoff(app, SPEAKER_PIPELINE_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    let mut keep: Vec<String> = Vec::new();
+    let mut blocked: Option<String> = None;
+
+    // "submitted" returns every talk proposal regardless of approval status
+    // (docs/agents-api.md), which already covers proposed/under_review/
+    // approved/declined in one call.
+    match api.rsvp_search_speakers(meetup_token, "submitted", SPEAKER_SEARCH_LIMIT).await {
+        Ok(ok) => {
+            let rows = ok
+                .data
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            for row in &rows {
+                if let Some(rref) = db::upsert_speaker_proposal(&conn, meetup_token, row, &now)? {
+                    keep.push(rref);
+                }
+            }
+            record_rate_locked(&conn, SPEAKER_PIPELINE_KEY, &ok.rate);
+        }
+        Err(e) if e.is_capability_block() => {
+            blocked = Some(speaker_error_code(&e).to_string());
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SPEAKER_PIPELINE_KEY, parse_retry_after(&msg));
+            return Err(AppError::RateLimited(msg));
+        }
+        Err(_) => {}
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.lock().unwrap();
+        if blocked.is_none() {
+            db::retain_speaker_proposals(&conn, meetup_token, &keep)?;
+        }
+        db::set_sync_state(&conn, SPEAKER_PIPELINE_KEY, Some(&now), None, None, blocked.is_some(), blocked.as_deref())?;
+    }
+
+    let _ = app.emit("speaker_pipeline:updated", json!({ "meetup_token": meetup_token }));
+    Ok(())
+}
+
+/// Fetch + cache the ranked candidate pool for one scope (task 3.2). On a
+/// capability block or 429, the previously-cached candidates are left
+/// untouched and the meta row is flagged unavailable (spec: "candidate panel
+/// keeps last-good cached data").
+pub async fn fetch_speaker_candidates(app: &AppHandle, weblog_token: Option<&str>) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Ok(()) };
+    let scope = weblog_token.unwrap_or("").to_string();
+    if in_backoff(app, SPEAKER_CANDIDATES_KEY) {
+        return Ok(());
+    }
+    let now = iso_now();
+    match api.speaker_pipeline_candidates_get(weblog_token, 50).await {
+        Ok(ok) => {
+            let candidates = ok.data.get("candidates").and_then(Value::as_array).cloned().unwrap_or_default();
+            let truncated = ok.data.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::replace_speaker_candidates(&conn, &scope, &candidates, truncated, &now)?;
+            record_rate_locked(&conn, SPEAKER_CANDIDATES_KEY, &ok.rate);
+        }
+        Err(e) if e.is_capability_block() => {
+            let code = speaker_error_code(&e);
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::mark_speaker_candidates_unavailable(&conn, &scope, code, &now)?;
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SPEAKER_CANDIDATES_KEY, parse_retry_after(&msg));
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::mark_speaker_candidates_unavailable(&conn, &scope, "rate_limited", &now)?;
+        }
+        Err(_) => {
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            db::mark_speaker_candidates_unavailable(&conn, &scope, "unavailable", &now)?;
+        }
+    }
+    let _ = app.emit("speaker_candidates:updated", json!({ "scope": scope }));
+    Ok(())
+}
+
+/// The scope key `fetch_speaker_candidates`/`get_speaker_candidates` use when
+/// the caller doesn't pass an explicit `weblog_token` — the primary chapter
+/// from the cached identity (mirrors the pattern other single-scope caches use).
+pub fn default_speaker_candidate_scope(app: &AppHandle) -> String {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().unwrap();
+    db::primary_weblog(&conn).ok().flatten().unwrap_or_default()
+}
+
+/// Set (or clear) a proposal's `speaker_status` and/or title/description via
+/// `rsvp_speaker_proposal_upsert`. Called ONLY from
+/// `commands::speaker_proposal_upsert_commit` after the write_guard token has
+/// already been validated. `send_speaker_email`/`send_rsvp_email` are always
+/// pinned false in `api.rs` — no caller here can set them true. On `429` this
+/// does NOT retry (mirrors `rsvp_state_update`) — it records backoff
+/// bookkeeping and propagates the error so the caller must re-confirm.
+pub async fn speaker_proposal_upsert(
+    app: &AppHandle,
+    meetup_token: &str,
+    rsvp_ref: &str,
+    speaker_title: &str,
+    speaker_description: &str,
+    speaker_status: Option<&str>,
+    note: Option<&str>,
+) -> AppResult<()> {
+    let Some(api) = client(app)? else { return Err(AppError::NoKey) };
+    match api
+        .rsvp_speaker_proposal_upsert(rsvp_ref, speaker_title, speaker_description, speaker_status, note)
+        .await
+    {
+        Ok(ok) => {
+            let now = iso_now();
+            {
+                let state = app.state::<AppState>();
+                let conn = state.db.lock().unwrap();
+                // Opportunistic merge of the write response; the priority
+                // post-write refresh below is the authoritative settle (design
+                // D5, mirrors rsvp_state_update).
+                let _ = db::upsert_speaker_proposal(&conn, meetup_token, &ok.data, &now);
+                record_rate_locked(&conn, SPEAKER_WRITE_KEY, &ok.rate);
+            }
+            refresh_speaker_proposal_after_write(app, meetup_token, rsvp_ref).await;
+            Ok(())
+        }
+        Err(AppError::RateLimited(msg)) => {
+            apply_backoff(app, SPEAKER_WRITE_KEY, parse_retry_after(&msg));
+            Err(AppError::RateLimited(msg))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Priority post-write refresh (design "Read-then-write freshness"):
+/// immediately re-read the affected RSVP via `rsvp_get` so the cached lane
+/// (and any newly-unlocked `phone_number`) converges on the server's
+/// authoritative state right away rather than waiting for the next open.
+async fn refresh_speaker_proposal_after_write(app: &AppHandle, meetup_token: &str, rsvp_ref: &str) {
+    if let Ok(Some(api)) = client(app) {
+        if let Ok(ok) = api.rsvp_get(rsvp_ref).await {
+            let now = iso_now();
+            let state = app.state::<AppState>();
+            let conn = state.db.lock().unwrap();
+            let _ = db::upsert_speaker_proposal(&conn, meetup_token, &ok.data, &now);
+        }
+    }
+    let _ = app.emit(
+        "speaker_write:settled",
+        json!({ "meetup_token": meetup_token, "rsvp_ref": rsvp_ref }),
+    );
+}

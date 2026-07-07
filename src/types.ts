@@ -618,3 +618,87 @@ export interface CheckinDenial {
   rsvp_ref: string;
   error_code?: string | null;
 }
+
+// ── Speaker review (specs/speaker-review) ───────────────────────────────────
+// The app's third write feature. Reads (proposal pipeline, candidate pool)
+// render only from cache; approve/decline and the create/edit-proposal form
+// both go through `rsvps/speaker_proposal_upsert` behind the same
+// prepare/commit confirmation gate as rsvp-screening and attendance-checkin.
+
+export type SpeakerApprovalStatus = "pending_review" | "main_stage" | "science_fair" | "sidelined";
+
+export type SpeakerLane = "proposed" | "under_review" | "approved" | "declined" | "other";
+
+// phone_number is present ONLY when the API includes it (Contact Field
+// Visibility Policy is server-side authoritative) — never derived client-side.
+export interface SpeakerProposal {
+  rsvp_ref: string;
+  meetup_token: string;
+  name?: string | null;
+  email?: string | null;
+  phone_number?: string | null;
+  speaker_title?: string | null;
+  speaker_description?: string | null;
+  speaker_status?: string | null;
+  speaker_approval_status?: string | null;
+  lane: SpeakerLane;
+  updated_at: string;
+}
+
+export interface SpeakerPipeline {
+  meetup_token: string;
+  rows: SpeakerProposal[];
+  lanes: {
+    proposed: SpeakerProposal[];
+    under_review: SpeakerProposal[];
+    approved: SpeakerProposal[];
+    declined: SpeakerProposal[];
+  };
+}
+
+export interface SpeakerCandidate {
+  client_token: string;
+  sample_rsvp_token?: string;
+  name?: string;
+  email?: string;
+  home_city?: string;
+  matched_cities?: string[];
+  speaker_fit_score?: number;
+  talk_history_summary?: string;
+  engagement_signals?: unknown;
+  recommended_topic_angles?: string[];
+  why_now?: string[];
+  refs?: unknown;
+  [k: string]: unknown;
+}
+
+export interface SpeakerCandidatesResult {
+  scope: string;
+  candidates: SpeakerCandidate[];
+  meta: {
+    truncated: boolean;
+    unavailable: boolean;
+    reason?: string | null;
+    fetched_at: string | null;
+  };
+}
+
+// Returned by `speaker_approval_prepare`/`speaker_proposal_prepare` — echoed
+// back unchanged (plus the identical mutation arguments) to the matching
+// `_commit`, or the write guardrail rejects it as tampered.
+export interface SpeakerConfirm {
+  token: string;
+  action: "speaker_proposal_upsert";
+  rsvp_ref: string;
+  speaker_title: string;
+  speaker_description: string;
+  from_lane?: string | null;
+  from_status?: string | null;
+  to_status?: string | null;
+  count: number;
+}
+
+export interface SpeakerWriteSettledEvent {
+  meetup_token: string;
+  rsvp_ref: string;
+}

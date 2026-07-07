@@ -350,6 +350,56 @@ pub fn init(conn: &Connection) -> AppResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_action_queue_status ON action_queue(status);
         CREATE INDEX IF NOT EXISTS idx_action_queue_meetup ON action_queue(meetup_token, kind);
+
+        -- Speaker review (specs/speaker-review). One row per talk-proposal
+        -- RSVP visible in a cached event's speaker pipeline, populated from
+        -- `rsvp_search` (speaker-tagged) and `rsvp_get` re-syncs.
+        -- `speaker_status`/`speaker_approval_status` are stored exactly as the
+        -- API returns them — kanban lane derivation happens at read time
+        -- (task 2.4), never invented client-side. `phone_number` is stored
+        -- only when the API includes it (Contact Field Visibility Policy is
+        -- server-side authoritative — the app never derives visibility).
+        CREATE TABLE IF NOT EXISTS speaker_proposals (
+            rsvp_ref                TEXT PRIMARY KEY,
+            meetup_token            TEXT NOT NULL,
+            name                    TEXT,
+            email                   TEXT,
+            phone_number            TEXT,
+            speaker_title           TEXT,
+            speaker_description     TEXT,
+            speaker_status          TEXT,
+            speaker_approval_status TEXT,
+            raw_json                TEXT,
+            updated_at              TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_speaker_proposals_meetup ON speaker_proposals(meetup_token);
+
+        -- Ranked future-speaker candidate pool
+        -- (`speaker_pipeline_candidates_get`), keyed by scope (weblog_token,
+        -- or '' for the caller's default scope). A recommendation panel,
+        -- distinct from the review funnel above (design: "Ranked candidate
+        -- pool as a distinct panel, not a lane").
+        CREATE TABLE IF NOT EXISTS speaker_candidates (
+            scope             TEXT NOT NULL,
+            client_token      TEXT NOT NULL,
+            name              TEXT,
+            speaker_fit_score REAL,
+            raw_json          TEXT,
+            fetched_at        TEXT NOT NULL,
+            PRIMARY KEY (scope, client_token)
+        );
+
+        -- Per-scope fetch header (degrade/truncation state), separate from
+        -- the candidate rows so a rate-limited refresh can keep the last-good
+        -- candidates in place untouched (spec: "Candidate refresh is
+        -- rate-limited").
+        CREATE TABLE IF NOT EXISTS speaker_candidates_meta (
+            scope        TEXT PRIMARY KEY,
+            truncated    INTEGER NOT NULL DEFAULT 0,
+            unavailable  INTEGER NOT NULL DEFAULT 0,
+            reason       TEXT,
+            fetched_at   TEXT NOT NULL
+        );
         "#,
     )?;
     // Migration for caches created before the `kind` column existed. ALTER
@@ -2316,6 +2366,244 @@ pub fn get_write_audit(conn: &Connection, id: &str) -> AppResult<Option<Value>> 
     Ok(row)
 }
 
+// ── Speaker review (specs/speaker-review) ───────────────────────────────────
+// Reads (proposal pipeline, candidate pool) render only from these caches.
+// Writes go through `rsvps/speaker_proposal_upsert` behind the shared
+// write_guard (commands.rs) and reuse `write_audit` for the durable trail —
+// no new audit table, per the design's "single implementation" decision.
+
+/// Kanban lane an RSVP's speaker fields map onto (design decision "Kanban
+/// lanes proposed -> under review -> approved"). Mirrors the API's own enum;
+/// no client-invented status. `declined` renders dimmed/collapsed, not one of
+/// the three primary lanes.
+pub fn speaker_lane(speaker_status: Option<&str>, speaker_approval_status: Option<&str>) -> &'static str {
+    match speaker_approval_status {
+        Some("main_stage") | Some("science_fair") => "approved",
+        Some("pending_review") => "under_review",
+        Some("sidelined") => "declined",
+        _ => {
+            if speaker_status == Some("submitted") {
+                "proposed"
+            } else {
+                "other"
+            }
+        }
+    }
+}
+
+/// Upsert one talk-proposal RSVP row from an `rsvp_search`/`rsvp_get` result.
+/// Mirrors `upsert_rsvp_row`'s flexible `{rsvp, client}`-or-flat shape
+/// handling. `phone_number` is written only when present in `row` — when the
+/// API omits it (a submitted-but-not-approved proposer), the column is
+/// overwritten back to NULL on every upsert rather than left stale from an
+/// earlier approved-state fetch (Contact-visibility handling: "stores absent
+/// when omitted").
+pub fn upsert_speaker_proposal(
+    conn: &Connection,
+    meetup_token: &str,
+    row: &Value,
+    now: &str,
+) -> AppResult<Option<String>> {
+    let rsvp = row.get("rsvp").cloned().unwrap_or_else(|| row.clone());
+    let client = row.get("client").cloned().unwrap_or(Value::Null);
+
+    let Some(rsvp_ref) = pick_str(&rsvp, &["rsvp_token", "token", "rsvp_ref"])
+        .or_else(|| pick_str(row, &["rsvp_token", "token", "rsvp_ref"]))
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let name = pick_str(&client, &["name"]).or_else(|| pick_str(row, &["name"])).map(str::to_string);
+    let email = pick_str(&client, &["email"]).or_else(|| pick_str(row, &["email"])).map(str::to_string);
+    let phone_number = pick_str(&client, &["phone_number"])
+        .or_else(|| pick_str(&rsvp, &["phone_number"]))
+        .or_else(|| pick_str(row, &["phone_number"]))
+        .map(str::to_string);
+    let speaker_title = pick_str(&rsvp, &["speaker_title"]).or_else(|| pick_str(row, &["speaker_title"])).map(str::to_string);
+    let speaker_description = pick_str(&rsvp, &["speaker_description"]).or_else(|| pick_str(row, &["speaker_description"])).map(str::to_string);
+    let speaker_status = pick_str(&rsvp, &["speaker_status"]).or_else(|| pick_str(row, &["speaker_status"])).map(str::to_string);
+    let speaker_approval_status = pick_str(&rsvp, &["speaker_approval_status"]).or_else(|| pick_str(row, &["speaker_approval_status"])).map(str::to_string);
+
+    conn.execute(
+        "INSERT INTO speaker_proposals
+           (rsvp_ref, meetup_token, name, email, phone_number, speaker_title,
+            speaker_description, speaker_status, speaker_approval_status, raw_json, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(rsvp_ref) DO UPDATE SET
+           meetup_token=excluded.meetup_token,
+           name=excluded.name,
+           email=excluded.email,
+           phone_number=excluded.phone_number,
+           speaker_title=excluded.speaker_title,
+           speaker_description=excluded.speaker_description,
+           speaker_status=excluded.speaker_status,
+           speaker_approval_status=excluded.speaker_approval_status,
+           raw_json=excluded.raw_json,
+           updated_at=excluded.updated_at",
+        params![
+            rsvp_ref, meetup_token, name, email, phone_number, speaker_title,
+            speaker_description, speaker_status, speaker_approval_status, row.to_string(), now
+        ],
+    )?;
+    Ok(Some(rsvp_ref))
+}
+
+fn speaker_proposal_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let speaker_status = r.get::<_, Option<String>>(5)?;
+    let speaker_approval_status = r.get::<_, Option<String>>(6)?;
+    let lane = speaker_lane(speaker_status.as_deref(), speaker_approval_status.as_deref());
+    Ok(json!({
+        "rsvp_ref": r.get::<_, String>(0)?,
+        "meetup_token": r.get::<_, String>(1)?,
+        "name": r.get::<_, Option<String>>(2)?,
+        "email": r.get::<_, Option<String>>(3)?,
+        "phone_number": r.get::<_, Option<String>>(4)?,
+        "speaker_title": r.get::<_, Option<String>>(7)?,
+        "speaker_description": r.get::<_, Option<String>>(8)?,
+        "speaker_status": speaker_status,
+        "speaker_approval_status": speaker_approval_status,
+        "lane": lane,
+        "updated_at": r.get::<_, String>(9)?,
+    }))
+}
+
+const SPEAKER_PROPOSAL_COLS: &str = "rsvp_ref, meetup_token, name, email, phone_number, speaker_status,
+    speaker_approval_status, speaker_title, speaker_description, updated_at";
+
+/// One cached talk-proposal RSVP row, if any — used before preparing an
+/// approve/decline/upsert confirmation (to show from/to lane, and to fill in
+/// the required `speaker_title`/`speaker_description` when only the status is
+/// changing).
+pub fn get_speaker_proposal(conn: &Connection, rsvp_ref: &str) -> AppResult<Option<Value>> {
+    let sql = format!("SELECT {SPEAKER_PROPOSAL_COLS} FROM speaker_proposals WHERE rsvp_ref = ?1");
+    let row = conn.query_row(&sql, params![rsvp_ref], speaker_proposal_row).optional()?;
+    Ok(row)
+}
+
+/// The cached talk-proposal pipeline for one event, grouped into the four
+/// lanes (task 2.4) — the kanban screen renders only from this.
+pub fn get_speaker_proposals(conn: &Connection, meetup_token: &str) -> AppResult<Value> {
+    let sql = format!(
+        "SELECT {SPEAKER_PROPOSAL_COLS} FROM speaker_proposals WHERE meetup_token = ?1 ORDER BY (name IS NULL), name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![meetup_token], speaker_proposal_row)?;
+    let list: Vec<Value> = rows.filter_map(Result::ok).collect();
+
+    let mut proposed = Vec::new();
+    let mut under_review = Vec::new();
+    let mut approved = Vec::new();
+    let mut declined = Vec::new();
+    for row in &list {
+        match row.get("lane").and_then(Value::as_str).unwrap_or("other") {
+            "proposed" => proposed.push(row.clone()),
+            "under_review" => under_review.push(row.clone()),
+            "approved" => approved.push(row.clone()),
+            "declined" => declined.push(row.clone()),
+            _ => {}
+        }
+    }
+    Ok(json!({
+        "meetup_token": meetup_token,
+        "rows": list,
+        "lanes": {
+            "proposed": proposed,
+            "under_review": under_review,
+            "approved": approved,
+            "declined": declined,
+        },
+    }))
+}
+
+/// Evict proposals for this event no longer returned by the latest sync
+/// sweep (mirrors `retain_rsvp_rows`).
+pub fn retain_speaker_proposals(conn: &Connection, meetup_token: &str, keep: &[String]) -> AppResult<()> {
+    let existing: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT rsvp_ref FROM speaker_proposals WHERE meetup_token = ?1")?;
+        let rows = stmt.query_map(params![meetup_token], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    for rref in existing {
+        if !keep.iter().any(|k| k == &rref) {
+            conn.execute("DELETE FROM speaker_proposals WHERE rsvp_ref = ?1", params![rref])?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace the whole ranked candidate pool for one scope with a fresh
+/// successful fetch (mirrors `upsert_sponsor_contacts`'s full-replace
+/// posture) — only called on a successful fetch; a 429/forbidden leaves the
+/// existing rows untouched (task 3.2).
+pub fn replace_speaker_candidates(conn: &Connection, scope: &str, candidates: &[Value], truncated: bool, now: &str) -> AppResult<()> {
+    conn.execute("DELETE FROM speaker_candidates WHERE scope = ?1", params![scope])?;
+    for c in candidates {
+        let Some(token) = pick_str(c, &["client_token"]) else { continue };
+        let name = pick_str(c, &["name"]);
+        let score = pick_num(c, &["speaker_fit_score"]);
+        conn.execute(
+            "INSERT INTO speaker_candidates (scope, client_token, name, speaker_fit_score, raw_json, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(scope, client_token) DO UPDATE SET
+               name=excluded.name, speaker_fit_score=excluded.speaker_fit_score,
+               raw_json=excluded.raw_json, fetched_at=excluded.fetched_at",
+            params![scope, token, name, score, c.to_string(), now],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO speaker_candidates_meta (scope, truncated, unavailable, reason, fetched_at)
+         VALUES (?1, ?2, 0, NULL, ?3)
+         ON CONFLICT(scope) DO UPDATE SET
+           truncated=excluded.truncated, unavailable=0, reason=NULL, fetched_at=excluded.fetched_at",
+        params![scope, truncated as i64, now],
+    )?;
+    Ok(())
+}
+
+/// Record a failed/rate-limited candidate refresh without touching the
+/// existing rows (spec: "candidate panel keeps last-good cached data").
+pub fn mark_speaker_candidates_unavailable(conn: &Connection, scope: &str, reason: &str, now: &str) -> AppResult<()> {
+    conn.execute(
+        "INSERT INTO speaker_candidates_meta (scope, truncated, unavailable, reason, fetched_at)
+         VALUES (?1, 0, 1, ?2, ?3)
+         ON CONFLICT(scope) DO UPDATE SET unavailable=1, reason=excluded.reason, fetched_at=excluded.fetched_at",
+        params![scope, reason, now],
+    )?;
+    Ok(())
+}
+
+/// The cached candidate pool for one scope, descending `speaker_fit_score`,
+/// plus the degrade/truncation header.
+pub fn get_speaker_candidates(conn: &Connection, scope: &str) -> AppResult<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT raw_json FROM speaker_candidates WHERE scope = ?1 ORDER BY speaker_fit_score DESC",
+    )?;
+    let rows = stmt.query_map(params![scope], |r| r.get::<_, String>(0))?;
+    let candidates: Vec<Value> = rows
+        .filter_map(Result::ok)
+        .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
+        .collect();
+
+    let meta = conn
+        .query_row(
+            "SELECT truncated, unavailable, reason, fetched_at FROM speaker_candidates_meta WHERE scope = ?1",
+            params![scope],
+            |r| {
+                Ok(json!({
+                    "truncated": r.get::<_, i64>(0)? != 0,
+                    "unavailable": r.get::<_, i64>(1)? != 0,
+                    "reason": r.get::<_, Option<String>>(2)?,
+                    "fetched_at": r.get::<_, String>(3)?,
+                }))
+            },
+        )
+        .optional()?
+        .unwrap_or_else(|| json!({ "truncated": false, "unavailable": false, "reason": null, "fetched_at": null }));
+
+    Ok(json!({ "scope": scope, "candidates": candidates, "meta": meta }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3059,6 +3347,167 @@ mod tests {
         let row = get_write_audit(&c, "aud1").unwrap().unwrap();
         assert_eq!(row.get("action").and_then(Value::as_str), Some("checkin_mark_attended"));
         assert_eq!(row.get("outcome").and_then(Value::as_str), Some("ok"));
+        let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+    }
+
+    // ── Speaker review (specs/speaker-review) ──────────────────────────────
+
+    #[test]
+    fn speaker_lane_derivation_matches_the_spec_enum() {
+        // proposed: submitted, no review marker yet.
+        assert_eq!(speaker_lane(Some("submitted"), None), "proposed");
+        assert_eq!(speaker_lane(Some("submitted"), Some("not_approved")), "proposed");
+        // under review.
+        assert_eq!(speaker_lane(Some("submitted"), Some("pending_review")), "under_review");
+        // approved: main_stage or science_fair.
+        assert_eq!(speaker_lane(Some("submitted"), Some("main_stage")), "approved");
+        assert_eq!(speaker_lane(Some("submitted"), Some("science_fair")), "approved");
+        // declined: sidelined renders dimmed, not a primary lane.
+        assert_eq!(speaker_lane(Some("submitted"), Some("sidelined")), "declined");
+        // no submission at all.
+        assert_eq!(speaker_lane(None, None), "other");
+    }
+
+    #[test]
+    fn speaker_proposal_cache_round_trip_from_search_shaped_payload() {
+        let c = mem();
+        let row = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp1", "speaker_status": "submitted",
+                "speaker_approval_status": "pending_review",
+                "speaker_title": "Building agentic workflows",
+                "speaker_description": "A talk about agents."
+            },
+            "client": { "name": "Jane Speaker", "email": "jane@example.com" }
+        });
+        let rref = upsert_speaker_proposal(&c, "m1", &row, "t1").unwrap();
+        assert_eq!(rref.as_deref(), Some("rsvp1"));
+
+        let cached = get_speaker_proposal(&c, "rsvp1").unwrap().expect("row must exist");
+        assert_eq!(cached.get("speaker_title").and_then(Value::as_str), Some("Building agentic workflows"));
+        assert_eq!(cached.get("lane").and_then(Value::as_str), Some("under_review"));
+        assert_eq!(cached.get("phone_number").cloned(), Some(Value::Null), "omitted phone_number must be stored as absent");
+
+        let pipeline = get_speaker_proposals(&c, "m1").unwrap();
+        let under_review = pipeline.get("lanes").and_then(|l| l.get("under_review")).and_then(Value::as_array).unwrap();
+        assert_eq!(under_review.len(), 1);
+        assert!(pipeline.get("lanes").and_then(|l| l.get("proposed")).and_then(Value::as_array).unwrap().is_empty());
+    }
+
+    #[test]
+    fn speaker_proposal_phone_number_present_only_when_api_returns_it() {
+        let c = mem();
+        let approved = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp2", "speaker_status": "submitted",
+                "speaker_approval_status": "main_stage",
+                "speaker_title": "t", "speaker_description": "d"
+            },
+            "client": { "name": "Approved Speaker", "phone_number": "+15551234567" }
+        });
+        upsert_speaker_proposal(&c, "m1", &approved, "t1").unwrap();
+        let cached = get_speaker_proposal(&c, "rsvp2").unwrap().unwrap();
+        assert_eq!(cached.get("phone_number").and_then(Value::as_str), Some("+15551234567"));
+        assert_eq!(cached.get("lane").and_then(Value::as_str), Some("approved"));
+
+        // A later re-sync where the API no longer includes phone_number (e.g.
+        // scope changed) must overwrite the cache back to absent, not leave
+        // the earlier value stale (Contact-visibility handling).
+        let resynced = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp2", "speaker_status": "submitted",
+                "speaker_approval_status": "main_stage",
+                "speaker_title": "t", "speaker_description": "d"
+            },
+            "client": { "name": "Approved Speaker" }
+        });
+        upsert_speaker_proposal(&c, "m1", &resynced, "t2").unwrap();
+        let cached2 = get_speaker_proposal(&c, "rsvp2").unwrap().unwrap();
+        assert_eq!(cached2.get("phone_number").cloned(), Some(Value::Null));
+    }
+
+    #[test]
+    fn speaker_approval_status_change_is_reflected_after_commit_resync() {
+        let c = mem();
+        let submitted = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp3", "speaker_status": "submitted",
+                "speaker_approval_status": Value::Null,
+                "speaker_title": "t", "speaker_description": "d"
+            }
+        });
+        upsert_speaker_proposal(&c, "m1", &submitted, "t1").unwrap();
+        assert_eq!(get_speaker_proposal(&c, "rsvp3").unwrap().unwrap().get("lane").and_then(Value::as_str), Some("proposed"));
+
+        // Simulates the post-write rsvp_get re-sync after an approve commit.
+        let approved = json!({
+            "rsvp": {
+                "rsvp_token": "rsvp3", "speaker_status": "submitted",
+                "speaker_approval_status": "main_stage",
+                "speaker_title": "t", "speaker_description": "d"
+            }
+        });
+        upsert_speaker_proposal(&c, "m1", &approved, "t2").unwrap();
+        let cached = get_speaker_proposal(&c, "rsvp3").unwrap().unwrap();
+        assert_eq!(cached.get("lane").and_then(Value::as_str), Some("approved"));
+        assert_eq!(cached.get("speaker_approval_status").and_then(Value::as_str), Some("main_stage"));
+    }
+
+    #[test]
+    fn speaker_proposal_retention_is_event_scoped() {
+        let c = mem();
+        upsert_speaker_proposal(&c, "m1", &json!({ "rsvp": { "rsvp_token": "a1", "speaker_status": "submitted" } }), "t1").unwrap();
+        upsert_speaker_proposal(&c, "m2", &json!({ "rsvp": { "rsvp_token": "b1", "speaker_status": "submitted" } }), "t1").unwrap();
+        retain_speaker_proposals(&c, "m1", &[]).unwrap();
+        assert!(get_speaker_proposals(&c, "m1").unwrap().get("rows").and_then(Value::as_array).unwrap().is_empty());
+        assert_eq!(get_speaker_proposals(&c, "m2").unwrap().get("rows").and_then(Value::as_array).unwrap().len(), 1, "other event's proposal must survive");
+    }
+
+    #[test]
+    fn speaker_candidate_cache_round_trip_and_ranking() {
+        let c = mem();
+        let candidates = vec![
+            json!({ "client_token": "c1", "name": "Low Fit", "speaker_fit_score": 40.0 }),
+            json!({ "client_token": "c2", "name": "High Fit", "speaker_fit_score": 92.5 }),
+        ];
+        replace_speaker_candidates(&c, "blog_x", &candidates, false, "t1").unwrap();
+        let pool = get_speaker_candidates(&c, "blog_x").unwrap();
+        let rows = pool.get("candidates").and_then(Value::as_array).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("name").and_then(Value::as_str), Some("High Fit"), "must be ranked by descending speaker_fit_score");
+        assert_eq!(pool.get("meta").and_then(|m| m.get("unavailable")).and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn speaker_candidate_rate_limit_keeps_last_good_cache() {
+        let c = mem();
+        let candidates = vec![json!({ "client_token": "c1", "name": "Cached Candidate", "speaker_fit_score": 80.0 })];
+        replace_speaker_candidates(&c, "blog_x", &candidates, false, "t1").unwrap();
+
+        mark_speaker_candidates_unavailable(&c, "blog_x", "rate_limited", "t2").unwrap();
+        let pool = get_speaker_candidates(&c, "blog_x").unwrap();
+        let rows = pool.get("candidates").and_then(Value::as_array).unwrap();
+        assert_eq!(rows.len(), 1, "a rate-limited refresh must not evict the last-good candidates");
+        assert_eq!(pool.get("meta").and_then(|m| m.get("unavailable")).and_then(Value::as_bool), Some(true));
+        assert_eq!(pool.get("meta").and_then(|m| m.get("reason")).and_then(Value::as_str), Some("rate_limited"));
+    }
+
+    #[test]
+    fn speaker_approval_write_audit_is_reused_for_a_committed_approval() {
+        // Speaker review reuses the same write_audit table as rsvp-screening
+        // and attendance-checkin — no bespoke audit table for this feature.
+        let c = mem();
+        insert_write_audit(
+            &c, "aud1", "speaker_proposal_upsert", Some("m1"), &["rsvp3".to_string()],
+            Some("pending_review"), Some("main_stage"), false, true, "t1",
+        )
+        .unwrap();
+        update_write_audit_outcome(&c, "aud1", "ok", None, "t2").unwrap();
+        let row = get_write_audit(&c, "aud1").unwrap().unwrap();
+        assert_eq!(row.get("action").and_then(Value::as_str), Some("speaker_proposal_upsert"));
+        assert_eq!(row.get("to_state").and_then(Value::as_str), Some("main_stage"));
+        assert_eq!(row.get("send_email").and_then(Value::as_bool), Some(false), "send_speaker_email/send_rsvp_email are always pinned false");
         let list = get_write_audit_for_event(&c, "m1", 10).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
     }
